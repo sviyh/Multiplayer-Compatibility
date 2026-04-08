@@ -74,6 +74,10 @@ namespace Multiplayer.Compat
         private static MethodInfo initiateTakeoffMethod;
         private static PropertyInfo validSubstructureProperty;
 
+        // Landing determinism — recompute BlockingThings for both clients
+        private static MethodInfo getBlockingThingsMethod;
+        private static MethodInfo gravshipTerrainsGetter;
+
         public VanillaGravshipExpanded(ModContentPack mod)
         {
             LongEventHandler.ExecuteWhenFinished(LatePatch);
@@ -423,6 +427,38 @@ namespace Multiplayer.Compat
             }
 
             #endregion
+
+            #region Landing determinism — BlockingThings recomputation
+
+            {
+                // GravshipMapGenUtility.BlockingThings is a static HashSet<Thing> populated
+                // during the landing UI flow (TryBeginLanding → GetBlockingThings), which only
+                // runs on the acting player. ApplyCrashlanding reads it during tick (both clients)
+                // inside LandingEnded, AFTER PlaceGravshipInMap → ClearThingsAt may have already
+                // destroyed the blockers. We must recompute BEFORE placement — during InitiateLanding,
+                // when blockers are still on the map.
+                var gravshipMapGenUtilType = AccessTools.TypeByName("VanillaGravshipExpanded.GravshipMapGenUtility");
+                getBlockingThingsMethod = AccessTools.Method(gravshipMapGenUtilType, "GetBlockingThings");
+
+                // Gravship type cannot be resolved via TypeByName — derive it from
+                // InitiateLanding's first parameter instead.
+                var controllerType = AccessTools.TypeByName("Verse.WorldComponent_GravshipController");
+                var initiateLandingMethod = AccessTools.Method(controllerType, "InitiateLanding");
+
+                if (initiateLandingMethod == null)
+                {
+                    Log.Error("[MPCompat/VGE] Failed to find InitiateLanding method");
+                }
+                else
+                {
+                    var gravshipType = initiateLandingMethod.GetParameters()[0].ParameterType;
+                    gravshipTerrainsGetter = AccessTools.PropertyGetter(gravshipType, "Terrains");
+                    MpCompat.harmony.Patch(initiateLandingMethod,
+                        prefix: new HarmonyMethod(typeof(VanillaGravshipExpanded), nameof(PreInitiateLanding)));
+                }
+            }
+
+            #endregion
         }
 
         #region Patches
@@ -435,6 +471,28 @@ namespace Multiplayer.Compat
         {
             if (!MP.IsExecutingSyncCommand)
                 CameraJumper.TryHideWorld();
+        }
+
+        /// <summary>
+        /// Recompute BlockingThings before PlaceGravshipInMap clears things from the map.
+        /// The static is normally populated during the landing UI (TryBeginLanding), which
+        /// only runs on the acting player. By patching InitiateLanding (before placement),
+        /// both clients compute the same blocker set from live map state while blockers
+        /// still exist. ApplyCrashlanding later reads the cached set during LandingEnded.
+        /// </summary>
+        private static void PreInitiateLanding(object gravship, Map map, IntVec3 landingPos)
+        {
+            if (!MP.IsInMultiplayer)
+                return;
+
+            // Build absolute cells from gravship terrain data offset by landing position.
+            // Terrains is a property (Dictionary<IntVec3, TerrainDef>) with relative cells.
+            var terrains = (System.Collections.IDictionary)gravshipTerrainsGetter.Invoke(gravship, null);
+            var cells = new HashSet<IntVec3>();
+            foreach (var key in terrains.Keys)
+                cells.Add((IntVec3)key + landingPos);
+
+            getBlockingThingsMethod.Invoke(null, new object[] { cells, map });
         }
 
         /// <summary>
