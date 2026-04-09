@@ -765,7 +765,10 @@ namespace Multiplayer.Compat
             else
             {
                 __0.mapHasGravAnchor = true;
-                SyncedAbandonTile(mapParent);
+                // Both clients reach this branch deterministically during tick —
+                // call abandon logic directly instead of through SyncedAbandonTile,
+                // which would defer execution via the sync system.
+                AbandonTileDirectly(mapParent);
             }
 
             return false;
@@ -783,6 +786,30 @@ namespace Multiplayer.Compat
         private static void SyncedAbandonTile(MapParent mapParent)
         {
             CloseMapDecisionDialog();
+            if (mapParent?.Map == null)
+                return;
+
+            var map = mapParent.Map;
+            if (mapParent is Settlement settlement && settlement.Faction == Faction.OfPlayer)
+            {
+                mapParent.Abandon(wasGravshipLaunch: false);
+            }
+            else
+            {
+                mapParent.ShouldRemoveMapNow(out var removeWorldObject);
+                Current.Game.DeinitAndRemoveMap(map, false);
+                if (!mapParent.Destroyed && (removeWorldObject || mapParent.forceRemoveWorldObjectWhenMapRemoved))
+                    mapParent.Destroy();
+            }
+        }
+
+        /// <summary>
+        /// Abandon a tile directly during tick, without going through the sync system.
+        /// Used when both clients deterministically reach the abandon path (no dialog).
+        /// Mirrors VGE's local AbandonTile() function in TakeoffEnded_Patch.Prefix.
+        /// </summary>
+        private static void AbandonTileDirectly(MapParent mapParent)
+        {
             if (mapParent?.Map == null)
                 return;
 
