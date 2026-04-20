@@ -174,6 +174,16 @@ namespace Multiplayer.Compat
             var type = AccessTools.TypeByName("VEF.Genes.CompHumanHatcher");
             PatchingUtilities.PatchSystemRand(AccessTools.Method(type, "Hatch"));
             MpCompat.RegisterLambdaMethod(type, "CompGetGizmosExtra", 0).SetDebugOnly();
+
+            // VEF's postfix on LifeStageWorker.Notify_LifeStageStarted re-applies gene
+            // effects (ApplyGeneEffects -> AddHediff) on every life-stage-start event.
+            // Vanilla 1.6's CompStatue.InitFakePawn triggers this via LockCurrentLifeStageIndex
+            // inside LongEventHandler on every save load / statue placement. RNG state there
+            // is ambient (no PushState wrapping), and AddHediff consumption differs between
+            // host and client by a single Rand.Value call, producing a recurring post-load
+            // desync. Wrap InitFakePawn in PushState/PopState so all RNG consumed by the
+            // fake-pawn init chain uses a deterministic seeded stream on both sides.
+            PatchingUtilities.PatchPushPopRand("RimWorld.CompStatue:InitFakePawn");
         }
 
         private static void PatchExtraPregnancyApproaches()
