@@ -8,7 +8,6 @@ using RimWorld.Planet;
 using UnityEngine;
 using VanillaGravshipExpanded;
 using Verse;
-using Verse.Sound;
 
 namespace Multiplayer.Compat
 {
@@ -33,9 +32,6 @@ namespace Multiplayer.Compat
         // VGE launch flow — MP internals (not publicized, reached via reflection)
         private static Action<PlanetTile> closeGravshipSession;
         private static Func<PlanetTile, bool> hasGravshipSession;
-
-        // VGE PreLaunchConfirmation sync — capture original before VGE's prefix replaces it
-        private static Action capturedOriginalLaunchAction;
 
         // MP internals reflection for MultiFaction area sync.
         // MP.Client types are deliberately NOT publicized — direct reflection required.
@@ -240,19 +236,15 @@ namespace Multiplayer.Compat
 
                 MP.RegisterSyncMethod(typeof(VanillaGravshipExpanded), nameof(SyncedGravshipTileSelected));
 
-                // Sync VGE's replacement launch action in the prelaunch confirmation dialog.
-                // VGE replaces the vanilla launchAction (synced by MP as lambda 0 in Apply)
-                // with its own delegate, so MP's sync never fires for VGE launches.
-                // Two prefixes: high-priority captures original, low-priority detects replacement.
-                var preLaunchMethod = AccessTools.DeclaredMethod(typeof(GravshipUtility), nameof(GravshipUtility.PreLaunchConfirmation));
-                MpCompat.harmony.Patch(preLaunchMethod,
-                    prefix: new HarmonyMethod(typeof(VanillaGravshipExpanded), nameof(CaptureOriginalLaunchAction))
-                    { priority = Priority.First });
-                MpCompat.harmony.Patch(preLaunchMethod,
-                    prefix: new HarmonyMethod(typeof(VanillaGravshipExpanded), nameof(WrapVgeLaunchAction))
-                    { priority = Priority.Last });
+                // VGE PR #6 exposed ExecuteGravshipLaunch as a public static method that VGE's
+                // PreLaunchConfirmation prefix invokes via lambda. Sync it directly.
+                MP.RegisterSyncMethod(typeof(GravshipUtility_PreLaunchConfirmation_Patch),
+                    nameof(GravshipUtility_PreLaunchConfirmation_Patch.ExecuteGravshipLaunch));
 
-                MP.RegisterSyncMethod(typeof(VanillaGravshipExpanded), nameof(SyncedVgeLaunchConfirm));
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredMethod(typeof(GravshipUtility_PreLaunchConfirmation_Patch),
+                        nameof(GravshipUtility_PreLaunchConfirmation_Patch.ExecuteGravshipLaunch)),
+                    prefix: new HarmonyMethod(typeof(VanillaGravshipExpanded), nameof(PreExecuteGravshipLaunchCloseDialog)));
             }
 
             #endregion
@@ -414,7 +406,7 @@ namespace Multiplayer.Compat
         private static void PreShowRitualClearStaleState()
         {
             if (MP.IsInMultiplayer && !inSyncedTileSelectedFlow)
-                Dialog_BeginRitual_ShowRitualBeginWindow_Patch.state = null;
+                Dialog_BeginRitual_ShowRitualBeginWindow_Patch.ClearLaunchState();
         }
 
         private static bool PreCommandRitualProcessInput_SyncIfGravshipLaunch(Command_Ritual __instance)
@@ -460,135 +452,55 @@ namespace Multiplayer.Compat
             return false;
         }
 
-        /// <summary>
-        /// Synced tile selection for VGE's gravship launch flow.
-        /// Closes the tile picker and GravshipTravelSession, stores the tile,
-        /// switches to map view, and calls ShowRitualBeginWindow so MP creates
-        /// a RitualSession for the launch ritual.
-        /// </summary>
+        /// <summary>Synced tile selection — MP cleanup (picker, session) then delegate to VGE's named entry (PR #6).</summary>
         private static void SyncedGravshipTileSelected(Building_GravEngine gravEngine, PlanetTile tile)
         {
             var state = Dialog_BeginRitual_ShowRitualBeginWindow_Patch.state;
             if (state == null)
                 return;
 
-            // Guard against duplicate tile selections (both players picked tiles).
-            // If the GravshipTravelSession was already closed by a prior call, skip.
+            // Dup-selection guard: session already closed by a prior synced call → skip.
             if (hasGravshipSession != null && !hasGravshipSession(gravEngine.Map.Tile))
                 return;
 
-            // Store tile in VGE's state (used later by VGE's ritual outcome patches)
-            state.targetTile = tile;
-            SettlementProximityGoodwillUtility_CheckConfirmSettle_Patch.targetTile = tile;
-
-            // Save ShowRitualBeginWindow args from state before tile picker cleanup
-            var ritualInstance = state.instance;
-            var targetInfo = state.targetInfo;
-            var forObligation = state.forObligation;
-            var selectedPawn = state.selectedPawn;
-            var forcedForRole = state.forcedForRole;
-
-            // Close tile picker using StopTargetingInt to bypass VGE's
-            // TilePicker_StopTargeting_Patch (which would clear state too early)
+            // MP-specific cleanup (not in VGE's OnGravshipTileSelected):
+            //   StopTargetingInt — bypass VGE's TilePicker prefix which would clear state too early
+            //   closeGravshipSession — close MP's GravshipTravelSession (it pauses the map)
             Find.World.renderer.wantedMode = WorldRenderMode.None;
             Find.TilePicker.StopTargetingInt();
-
-            // Close the GravshipTravelSession that MP created (it pauses the map,
-            // which would prevent the ritual from running)
             closeGravshipSession?.Invoke(gravEngine.Map.Tile);
 
-            // Switch to map view (replicates VGE's settleAction UI operations)
-            CameraJumper.TryHideWorld();
-            Current.Game.CurrentMap = gravEngine.Map;
-            Find.CameraDriver.JumpToCurrentMapLoc(gravEngine.Position);
-
-            // Call ShowRitualBeginWindow — VGE state is set so VGE's prefix falls
-            // through to the original. In ExecutingCmds, MP's CancelDialogBeginRitual
-            // intercepts the dialog creation and creates a RitualSession instead.
-            // Set flag so PreShowRitualClearStaleState doesn't clear state during this call.
+            // Delegate camera ops + ShowRitualBeginWindow + targetTile writes to VGE.
+            // inSyncedTileSelectedFlow guards PreShowRitualClearStaleState during the call.
             inSyncedTileSelectedFlow = true;
             try
             {
-                ritualInstance?.ShowRitualBeginWindow(targetInfo, forObligation, selectedPawn, forcedForRole);
+                SettlementProximityGoodwillUtility_CheckConfirmSettle_Patch.OnGravshipTileSelected(gravEngine, tile, state);
             }
             finally
             {
                 inSyncedTileSelectedFlow = false;
             }
 
-            // Clear VGE state now that ShowRitualBeginWindow has consumed it.
-            // VGE's Window_PostClose_Patch and TilePicker_StopTargeting_Patch clear state
-            // in UI context (non-deterministic between clients). By clearing here in sync
-            // context, we ensure state is always null for the next launch attempt,
-            // regardless of how this launch ends (complete, cancel, or interrupted).
-            // The target tile is stored separately in CheckConfirmSettle_Patch.targetTile
-            // and LordJob_Ritual_ExposeData_Patch.targetTile, so it's not lost.
-            Dialog_BeginRitual_ShowRitualBeginWindow_Patch.state = null;
+            Dialog_BeginRitual_ShowRitualBeginWindow_Patch.ClearLaunchState();
         }
 
-        /// <summary>
-        /// High-priority prefix on PreLaunchConfirmation: captures the original
-        /// launchAction before VGE's prefix can replace it.
-        /// </summary>
-        private static void CaptureOriginalLaunchAction(ref Action launchAction)
+        /// <summary>Close the prelaunch confirm Dialog_MessageBox on non-clicking clients before sync replay.</summary>
+        private static void PreExecuteGravshipLaunchCloseDialog()
         {
-            if (!MP.IsInMultiplayer)
+            if (!MP.IsInMultiplayer || !MP.IsExecutingSyncCommand)
                 return;
 
-            capturedOriginalLaunchAction = launchAction;
-        }
-
-        /// <summary>
-        /// Low-priority prefix on PreLaunchConfirmation: if VGE replaced the
-        /// launchAction (detected by comparing to captured original), wrap it
-        /// with a synced call so the launch executes on all clients.
-        /// </summary>
-        private static void WrapVgeLaunchAction(Building_GravEngine engine, ref Action launchAction)
-        {
-            if (!MP.IsInMultiplayer)
-                return;
-
-            // If VGE didn't modify the action, vanilla MP sync handles it
-            if (launchAction == capturedOriginalLaunchAction)
-                return;
-
-            launchAction = () =>
-            {
-                if (!MP.IsExecutingSyncCommand)
-                    SyncedVgeLaunchConfirm(engine);
-            };
-        }
-
-        /// <summary>
-        /// Synced VGE launch confirmation. Mirrors VGE's replacement launch delegate
-        /// (LaunchSequenceSwap.GravshipUtility_PreLaunchConfirmation_Patch). The tile
-        /// was stored in CheckConfirmSettle_Patch.targetTile during the earlier tile
-        /// selection step. We cannot invoke VGE's prefix directly because it looks up
-        /// the ritual lordJob, which may have completed by sync execution time.
-        /// </summary>
-        private static void SyncedVgeLaunchConfirm(Building_GravEngine engine)
-        {
-            var tile = SettlementProximityGoodwillUtility_CheckConfirmSettle_Patch.targetTile;
-            if (tile == null)
-                return;
-
-            // Close the prelaunch confirmation dialog on all clients
             var dialogPrefix = "ConfirmGravEngineLaunch".Translate().RawText;
-            foreach (var window in Find.WindowStack.Windows)
+            for (var i = Find.WindowStack.Windows.Count - 1; i >= 0; i--)
             {
-                if (window is Dialog_MessageBox msgBox && msgBox.text.RawText.StartsWith(dialogPrefix))
+                if (Find.WindowStack.Windows[i] is Dialog_MessageBox msgBox &&
+                    msgBox.text.RawText.StartsWith(dialogPrefix))
                 {
                     msgBox.Close();
                     break;
                 }
             }
-
-            WorldComponent_GravshipController.DestroyTreesAroundSubstructure(engine.Map, engine.ValidSubstructure);
-            Find.World.renderer.wantedMode = WorldRenderMode.None;
-            engine.ConsumeFuel(tile);
-            Find.GravshipController.InitiateTakeoff(engine, tile);
-            SoundDefOf.Gravship_Launch.PlayOneShotOnCamera();
-            Dialog_BeginRitual_ShowRitualBeginWindow_Patch.state = null;
         }
 
         /// <summary>
