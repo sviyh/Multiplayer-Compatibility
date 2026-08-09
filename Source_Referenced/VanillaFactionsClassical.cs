@@ -23,8 +23,6 @@ namespace Multiplayer.Compat
     [MpCompatFor("OskarPotocki.VFE.Classical")]
     class VanillaFactionsClassical
     {
-        private static bool syncDialog = false;
-
         public VanillaFactionsClassical(ModContentPack mod)
         {
             LongEventHandler.ExecuteWhenFinished(LatePatch);
@@ -40,18 +38,25 @@ namespace Multiplayer.Compat
             MpCompat.RegisterLambdaMethod(typeof(CompToggleHediff), nameof(CompToggleHediff.CompGetWornGizmosExtra), 1);
             // Recruit pawn
             MpCompat.RegisterLambdaDelegate(typeof(VeniVidiVici), nameof(VeniVidiVici.AddGizmo), 0);
+            // Open senator dialog on every client (captures settlement, caravan, and disabled state)
+            MpCompat.RegisterLambdaDelegate(typeof(WorldComponent_Senators), nameof(WorldComponent_Senators.MakeSenatorsGizmo), 0);
 
             // Deploying the scorpion
             MP.RegisterSyncWorker<Designator_InstallScorpion>(SyncInstallScorpion, shouldConstruct: true);
 
-            // Sync dialog closing and add pause lock.
-            // We only do it if it was opened from world map, not from faction list (which is for viewing only and has no interactions).
+            // Sync dialog closing and add pause lock for interactive dialogs.
             DialogUtilities.InitializeDialogCloseSync(true);
-            foreach (var ctor in AccessTools.GetDeclaredConstructors(typeof(Dialog_SenatorInfo)))
-                MpCompat.harmony.Patch(ctor, new HarmonyMethod(typeof(VanillaFactionsClassical), nameof(PostDialogOpen)));
+            var senatorDialogCtor = AccessTools.Constructor(typeof(Dialog_SenatorInfo), new[]
+            {
+                typeof(FactionExtension_SenatorInfo),
+                typeof(List<SenatorInfo>),
+                typeof(bool),
+            });
+            MpCompat.harmony.Patch(senatorDialogCtor,
+                postfix: new HarmonyMethod(typeof(VanillaFactionsClassical), nameof(PostDialogOpen)));
 
-            // Replace the buttons from senator list with our own
-            MpCompat.harmony.Patch(
+            // Isolate quest validation RNG in this interface-only method and replace its buttons.
+            PatchingUtilities.PatchPushPopRand(
                 AccessTools.Method(typeof(Dialog_SenatorInfo), nameof(Dialog_SenatorInfo.DrawSenatorInfo)),
                 transpiler: new HarmonyMethod(typeof(VanillaFactionsClassical), nameof(ReplaceSenatorButtons)));
 
@@ -67,8 +72,6 @@ namespace Multiplayer.Compat
 
             // Initialize senator component (if not initialized yet)
             MP.RegisterSyncMethod(typeof(WorldComponent_Senators), nameof(WorldComponent_Senators.CheckInit));
-            MpCompat.harmony.Patch(MpMethodUtil.GetLambda(typeof(WorldComponent_Senators), nameof(WorldComponent_Senators.AddSenatorsOption)),
-                prefix: new HarmonyMethod(typeof(VanillaFactionsClassical), nameof(PreDialogCreated)));
         }
 
         private static void StopTargeter() => Find.WorldTargeter.StopTargeting();
@@ -129,30 +132,28 @@ namespace Multiplayer.Compat
 
             var info = senatorList[senatorDataIndex];
 
-            var canTakeQuest = true;
-
             if (info.Quest != null)
             {
                 var state = info.Quest.State;
-                if (state != QuestState.Ongoing && state != QuestState.NotYetAccepted)
-                    info.Quest = null;
-                else
-                    canTakeQuest = false;
-            }
-
-            if (canTakeQuest)
-            {
-                var senatorInfo = WorldComponent_Senators.Instance.InfoFor(info.Pawn, dialog.Faction);
-                var quests = SenatorQuests.GetValidQuestsFrom(info.Pawn, out var slate);
-                if (quests.Any())
+                if (state == QuestState.Ongoing || state == QuestState.NotYetAccepted)
                 {
-                    info.Quest = (senatorInfo.Quest = SenatorQuests.GenerateQuestFor(quests, slate, senatorInfo, dialog.Faction));
-                    Find.QuestManager.Add(senatorInfo.Quest);
-                    QuestUtility.SendLetterQuestAvailable(senatorInfo.Quest);
+                    if (MP.IsExecutingSyncCommandIssuedBySelf)
+                        Messages.Message("VFEC.UI.AlreadyQuest".Translate(), MessageTypeDefOf.RejectInput, false);
+                    return;
                 }
             }
-            else
-                Messages.Message("VFEC.UI.AlreadyQuest".Translate(), MessageTypeDefOf.RejectInput, false);
+
+            var senatorInfo = WorldComponent_Senators.Instance.InfoFor(info.Pawn, dialog.Faction);
+            var quests = SenatorQuests.GetValidQuestsFrom(info.Pawn, out var slate);
+            var newQuest = SenatorQuests.GenerateQuestFor(quests, slate, senatorInfo, dialog.Faction);
+            if (newQuest != null)
+            {
+                info.Quest = senatorInfo.Quest = newQuest;
+                Find.QuestManager.Add(newQuest);
+                QuestUtility.SendLetterQuestAvailable(newQuest);
+            }
+            else if (MP.IsExecutingSyncCommandIssuedBySelf)
+                Messages.Message("VFEC.UI.NoQuestsAvailable".Translate(), MessageTypeDefOf.RejectInput, false);
         }
 
         private static void SyncedBribeButton(int senatorDataIndex)
@@ -233,16 +234,10 @@ namespace Multiplayer.Compat
             else if (patchedCount == 1) Log.Warning("Failed to fully patch Vanilla Factions - Classical senator buttons (only single patch was applied)");
         }
 
-        private static void PreDialogCreated()
-            => syncDialog = true;
-
-        private static void PostDialogOpen(Window __instance)
+        private static void PostDialogOpen(Window __instance, bool canInteract)
         {
-            if (MP.IsInMultiplayer && syncDialog)
-            {
-                syncDialog = false;
+            if (MP.IsInMultiplayer && canInteract)
                 DialogUtilities.PostDialogOpen_CloseSync_PauseLock(__instance);
-            }
         }
     }
 }
