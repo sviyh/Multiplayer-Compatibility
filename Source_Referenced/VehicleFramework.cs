@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Threading;
+using System.Threading.Tasks;
 using HarmonyLib;
 using JetBrains.Annotations;
 using Multiplayer.API;
@@ -14,6 +16,7 @@ using Vehicles;
 using Vehicles.Rendering;
 using Vehicles.World;
 using Verse;
+using Verse.AI.Group;
 using Verse.Sound;
 
 namespace Multiplayer.Compat
@@ -26,12 +29,13 @@ namespace Multiplayer.Compat
     {
         #region Fields
 
-        // MP fields
-        private static Type mpTransferableReferenceType;
-        private static ISyncField syncTradeableCount;
-
         // Mp Compat fields
-        private static bool shouldSyncInInterface = false;
+        private static Type caravanFormingSessionType;
+        private static Type caravanFormingProxyType;
+        private static MethodInfo caravanFormingChooseRouteMethod;
+        private static MethodInfo caravanFormingTrySendMethod;
+        private static MethodInfo vehicleTryFormAndSendMethod;
+        private static PlanetTile synchronizedVehicleStartingTile = PlanetTile.Invalid;
 
         // VehiclesModSettings
         private static ISyncField showAllCargoItemsField;
@@ -42,18 +46,13 @@ namespace Multiplayer.Compat
         // Designator_AreaRoad
         private static Designator_AreaRoad.RoadType localRoadType = Designator_AreaRoad.RoadType.Prioritize;
 
-        // Gizmo_RefuelableFuelTravel.refuelable field ref (cached for PreToggleFuelSwitch)
-        private static readonly AccessTools.FieldRef<Gizmo_RefuelableFuelTravel, CompFueledTravel> fuelGizmoRefuelableField
-            = AccessTools.FieldRefAccess<Gizmo_RefuelableFuelTravel, CompFueledTravel>("refuelable");
-
         #endregion
 
         #region Constructor
 
         public VehicleFramework(ModContentPack mod)
         {
-            // Some stuff needs it, some doesn't. Too much effort going through everything to see what
-            // needs late patch and what doesn't.
+            // Vehicle Framework initializes several patch targets and defs during play-data loading.
             LongEventHandler.ExecuteWhenFinished(LatePatch);
         }
 
@@ -67,6 +66,8 @@ namespace Multiplayer.Compat
 
             MethodInfo method;
 
+            // Only for optional overrides on dynamically discovered add-on types. The type/name API
+            // also resolves inherited methods, which would duplicate the base registration here.
             static ISyncMethod TrySyncDeclaredMethod(Type targetType, string targetMethodName)
             {
                 var declaredMethod = AccessTools.DeclaredMethod(targetType, targetMethodName);
@@ -75,8 +76,7 @@ namespace Multiplayer.Compat
                 return null;
             }
 
-            // Should be initialized by PatchCancelInInterface calls later on,
-            // so this exists here as an extra safety in case those ever get removed later on.
+            // Required because this compat class defers its registrations until play data is loaded.
             MpCompatPatchLoader.LoadPatch<VehicleFramework>();
 
             // Needed for overlay fix.
@@ -89,25 +89,11 @@ namespace Multiplayer.Compat
             #region Multithreading
 
             {
-                // Disable threading in those specific methods
-                var methods = new[]
-                {
-                    AccessTools.DeclaredMethod(typeof(PathingHelper), nameof(PathingHelper.RecalculatePerceivedPathCostAt)),
-                    AccessTools.DeclaredMethod(typeof(PathingHelper), nameof(PathingHelper.ThingAffectingRegionsOrientationChanged)),
-                    AccessTools.DeclaredMethod(typeof(PathingHelper), nameof(PathingHelper.ThingAffectingRegionsStateChange)),
-                };
-                var transpiler = new HarmonyMethod(typeof(VehicleFramework), nameof(ReplaceThreadAvailable));
-                foreach (var m in methods.Where(m => m != null))
-                    MpCompat.harmony.Patch(m, transpiler: transpiler);
-
-                // Vehicles.WorldVehiclePathGrid:RecalculateAllPerceivedPathCosts is going to run rarely enough
-                // and unless something changed on the world map (like changed tiles) then the result should end
-                // up being the same. The thread should be safe (in general) to keep in a separate thread.
-
-                // Vehicles.VehiclePathing has two methods which (likely) can be kept
-                // threaded. They are used for calculating ConcurrentListThings, but seems like is
-                // ever used for debug related stuff. (RegisterInVehicleRegions/DeregisterInVehicleRegions)
-                // This may not be 100% true (they could be referenced by name somewhere and used bu a transpiler).
+                // Path and region grids affect simulation decisions. Keep every grid update on the
+                // deterministic game thread rather than allowing completion timing to differ by peer.
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredPropertyGetter(typeof(VehiclePathingSystem), nameof(VehiclePathingSystem.ThreadAvailable)),
+                    postfix: new HarmonyMethod(typeof(VehicleFramework), nameof(DisableVehiclePathingThreadsInMultiplayer)));
             }
 
             #endregion
@@ -124,21 +110,44 @@ namespace Multiplayer.Compat
                 // Vehicle pawn
 
                 // Ordinals verified from compiled DLL IL (release build):
-                // Cancel load cargo (5), fish toggle (8),
-                // force leave caravan (14), cancel forming caravan (15)
+                // Cancel load cargo (5), fish toggle (8), cancel forming caravan (15)
                 // DisembarkAll is a method reference (no ordinal).
                 // Load cargo (6) opens dialog, handled by LoadVehicleCargoSession.
                 // Fish isActive (7) is a getter, doesn't need syncing.
                 // Disembark all — method reference (no ordinal), sync directly
                 MP.RegisterSyncMethod(typeof(VehiclePawn), nameof(VehiclePawn.DisembarkAll));
-                // Disembark single (13) — synced via wrapper SyncedDisembarkPawn instead of lambda
-                //   or direct method (pawns inside vehicles are despawned, MP can't serialize them)
                 // Haul pawn target callback (10) — called when player selects a pawn in HaulTargeter
-                MpCompat.RegisterLambdaDelegate(typeof(VehiclePawn), nameof(VehiclePawn.GetGizmos), 5, 8, 10, 14, 15);
+                MpCompat.RegisterLambdaDelegate(typeof(VehiclePawn), nameof(VehiclePawn.GetGizmos), 5, 8, 10, 15);
+
+                // VehicleRoleHandler isn't a supported parent in Multiplayer's native held-Thing
+                // serializer. Identify the pawn through its synced vehicle instead.
+                MP.RegisterSyncMethod(typeof(VehiclePawn), nameof(VehiclePawn.DisembarkPawn))
+                    .TransformArgument(0, Serializer.New(
+                        (Pawn pawn, object target, object[] _) =>
+                            (vehicle: (VehiclePawn)target, pawnId: pawn.thingIDNumber),
+                        tuple => tuple.vehicle?.AllPawnsAboard
+                            .FirstOrDefault(pawn => pawn.thingIDNumber == tuple.pawnId)))
+                    .CancelIfAnyArgNull();
+
+                // Use VF's vehicle-aware departure action both from its own gizmo and from the
+                // vanilla force-departure confirmation shown on pawns in a vehicle caravan.
+                MP.RegisterSyncMethod(
+                        typeof(LordJob_FormAndSendVehicles),
+                        nameof(LordJob_FormAndSendVehicles.ForceCaravanLeave))
+                    .TransformTarget(Serializer.New(
+                        (LordJob_FormAndSendVehicles job) => job.lord,
+                        (Lord lord) => lord?.LordJob as LordJob_FormAndSendVehicles));
                 MpCompat.harmony.Patch(
-                    MpMethodUtil.GetLambda(typeof(VehiclePawn), nameof(VehiclePawn.GetGizmos), lambdaOrdinal: 13),
-                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreDisembarkSinglePawn)));
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedDisembarkPawn));
+                    AccessTools.DeclaredMethod(
+                        typeof(CaravanFormingUtility),
+                        nameof(CaravanFormingUtility.ForceCaravanDepart)),
+                    prefix: new HarmonyMethod(
+                        typeof(VehicleFramework),
+                        nameof(RedirectVehicleCaravanForceDeparture)));
+
+                // State-changing developer actions. Menu/targeter openers and visual-only actions stay local.
+                MpCompat.RegisterLambdaDelegate(typeof(VehiclePawn), nameof(VehiclePawn.GetGizmos), 17, 19, 22, 24, 25, 26, 28)
+                    .SetDebugOnly();
 
                 // Toggle drafted or (if moving) engage brakes.
                 MpCompat.RegisterLambdaMethod(typeof(VehicleIgnitionController), nameof(VehicleIgnitionController.GetGizmos), 1);
@@ -154,25 +163,20 @@ namespace Multiplayer.Compat
                 // Auto-refuel toggle, charging toggle, and refuel-from-cargo moved to Gizmo_RefuelableFuelTravel.
                 // Refuel from cargo opens Dialog_Slider → calls ConsumeFuelFromInventory
                 MP.RegisterSyncMethod(typeof(CompFueledTravel), nameof(CompFueledTravel.ConsumeFuelFromInventory));
-                // Sync ToggleAutoRefuel and ToggleCharging via prefix → synced wrapper on the comp.
-                // DrawHeader calls ToggleAutoRefuel directly (not ToggleSwitch).
-                MpCompat.harmony.Patch(
-                    AccessTools.DeclaredMethod(typeof(Gizmo_RefuelableFuelTravel), "ToggleAutoRefuel"),
-                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreToggleFuelSwitch)));
-                MpCompat.harmony.Patch(
-                    AccessTools.DeclaredMethod(typeof(Gizmo_RefuelableFuelTravel), "ToggleCharging"),
-                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreToggleFuelSwitch)));
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedToggleFuelSwitch));
+                MP.RegisterSyncMethod(typeof(Gizmo_RefuelableFuelTravel), nameof(Gizmo_RefuelableFuelTravel.ToggleAutoRefuel));
+                MP.RegisterSyncMethod(typeof(Gizmo_RefuelableFuelTravel), nameof(Gizmo_RefuelableFuelTravel.ToggleCharging));
+                MP.RegisterSyncMethod(typeof(CompFueledTravel), nameof(CompFueledTravel.ConsumeFuel), [typeof(float)])
+                    .SetDebugOnly();
                 // (Dev) set fuel to 0 (0), set fuel to max (1), set fuel to 99.99% (2)
                 // RefuelHalfway is a method reference (not a lambda), so doesn't consume an ordinal
-                MpCompat.RegisterLambdaMethod(typeof(CompFueledTravel), nameof(CompFueledTravel.DevModeGizmos), 0, 1, 2).SetDebugOnly();
-                // (Dev) set fuel to 0/max
-                MpCompat.RegisterLambdaMethod(typeof(CompFueledTravel), nameof(CompFueledTravel.CompCaravanGizmos), 0, 1).SetDebugOnly();
+                // Only 99.99% needs an atomic lambda; the other actions reach the named methods above.
+                MpCompat.RegisterLambdaMethod(typeof(CompFueledTravel), nameof(CompFueledTravel.DevModeGizmos), 2).SetDebugOnly();
 
                 MP.RegisterSyncMethod(typeof(CompVehicleTurrets), nameof(CompVehicleTurrets.SetQuotaLevel));
                 // Deploy turret is now a cached field (deployToggle), no lambda to register
-                // (Dev) full reload turret — only lambda in CompGetGizmosExtra now
-                MpCompat.RegisterLambdaDelegate(typeof(CompVehicleTurrets), nameof(CompVehicleTurrets.CompGetGizmosExtra), 0).SetDebugOnly();
+                // The dev gizmo's iterator closure is not a stable sync target: synchronizing the
+                // delegate can execute only on the issuing peer. Sync the underlying action instead.
+                MP.RegisterSyncMethod(typeof(CompVehicleTurrets), "DevModeReloadTurret").SetDebugOnly();
 
 
                 // Turret syncing in separate region
@@ -180,6 +184,85 @@ namespace Multiplayer.Compat
                 // `Vehicles.Gizmos` includes patches to add or edit gizmos in existing GetGizmos methods:
                 // `AddVehicleGizmosPassthrough` opens `Dialog_FormVehicleCaravan`, which we need to handle instead.
                 // `GizmosForVehicleCaravans` calls `CaravanFormingUtility.LateJoinFormingCaravan`, which is synced through MP.
+
+                // Pause movement (1) and toggle repairs (3).
+                MpCompat.RegisterLambdaMethod(typeof(VehicleCaravan), nameof(VehicleCaravan.GetGizmos), 1, 3);
+                // Down pawn (5), kill pawn (7), teleport (9), and repair all vehicles (10).
+                MpCompat.RegisterLambdaMethod(typeof(VehicleCaravan), nameof(VehicleCaravan.GetGizmos), 5, 7, 9, 10)
+                    .SetDebugOnly();
+                // Land at a player settlement and initiate a crash.
+                MP.RegisterSyncMethod(typeof(Patch_Debug), nameof(Patch_Debug.DebugLandAerialVehicle))
+                    .SetDebugOnly();
+                MP.RegisterSyncMethod(typeof(AerialVehicleInFlight), nameof(AerialVehicleInFlight.InitiateCrashEvent))
+                    .SetDebugOnly();
+
+                // Multiplayer deliberately marks its proxy as previously opened so vanilla keeps
+                // the session-owned transferables. Let Vehicle Framework initialize its own tabs
+                // without changing that vanilla lifecycle flag.
+                caravanFormingSessionType = AccessTools.TypeByName("Multiplayer.Client.CaravanFormingSession");
+                caravanFormingProxyType = AccessTools.TypeByName("Multiplayer.Client.CaravanFormingProxy");
+                caravanFormingChooseRouteMethod = caravanFormingSessionType == null
+                    ? null
+                    : AccessTools.DeclaredMethod(caravanFormingSessionType, "ChooseRoute");
+                caravanFormingTrySendMethod = caravanFormingSessionType == null
+                    ? null
+                    : AccessTools.DeclaredMethod(caravanFormingSessionType, "TryFormAndSendCaravan");
+
+                var vehicleFormCaravanPatchType = typeof(Patch_FormCaravanDialog);
+                var createTabListPostOpen = AccessTools.DeclaredMethod(
+                    vehicleFormCaravanPatchType,
+                    "CreateTabListPostOpen");
+                if (createTabListPostOpen != null && caravanFormingProxyType != null)
+                {
+                    MpCompat.harmony.Patch(
+                        createTabListPostOpen,
+                        prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PrepareVehicleTabsForCaravanFormingProxy)));
+                }
+
+                // Vehicle Framework uses its own route callback, bypassing Multiplayer's
+                // synchronized Dialog_FormCaravan.Notify_ChoseRoute hook. Route it back through
+                // that public dialog method so Multiplayer's existing caravan session handles it.
+                var vehicleChoseRouteMethod = MpMethodUtil.GetLocalFunc(
+                    vehicleFormCaravanPatchType,
+                    "WorldRoutePannerReroute",
+                    localFunc: "ChoseVehicleRoute");
+                if (vehicleChoseRouteMethod != null &&
+                    caravanFormingProxyType != null &&
+                    caravanFormingChooseRouteMethod != null)
+                {
+                    MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedChooseVehicleCaravanRoute));
+                    MpCompat.harmony.Patch(
+                        vehicleChoseRouteMethod,
+                        prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(SyncVehicleCaravanRoute)));
+                    MpCompat.harmony.Patch(
+                        AccessTools.DeclaredMethod(typeof(Dialog_FormCaravan), nameof(Dialog_FormCaravan.Notify_ChoseRoute)),
+                        transpiler: new HarmonyMethod(typeof(VehicleFramework), nameof(UseSynchronizedVehicleStartingTile)));
+
+                    // VF keeps a shuffled, process-local edge-cell cache. Rebuild it from the map's
+                    // canonical edge order before every MP use so prior UI calls cannot affect simulation.
+                    MpCompat.harmony.Patch(
+                        AccessTools.DeclaredMethod(typeof(CellFinderExtended), "CacheAndShuffleMapEdgeCells"),
+                        prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(ResetVehicleEdgeCellCache)));
+                }
+
+                // Keep Vehicle Framework's validation and warning dialogs local. Once its final
+                // formation function is reached, route the action through Multiplayer's existing
+                // caravan-forming session and execute that same function on the session dummy.
+                vehicleTryFormAndSendMethod = MpMethodUtil.GetLocalFunc(
+                    typeof(CaravanFormation),
+                    nameof(CaravanFormation.TrySendVehicleCaravan),
+                    localFunc: "TryFormAndSendCaravan");
+                if (vehicleTryFormAndSendMethod != null &&
+                    caravanFormingTrySendMethod != null)
+                {
+                    MpCompat.harmony.Patch(
+                        vehicleTryFormAndSendMethod,
+                        prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(RedirectVehicleCaravanSendToSession)));
+                    MpCompat.harmony.Patch(
+                        AccessTools.DeclaredMethod(typeof(Dialog_FormCaravan), nameof(Dialog_FormCaravan.TryFormAndSendCaravan)),
+                        prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(FormVehicleCaravanFromSessionDummy)));
+                }
+
             }
 
             #endregion
@@ -200,26 +283,19 @@ namespace Multiplayer.Compat
 
                 // Targetable turrets
                 method = MpMethodUtil.GetLambda(typeof(Command_TargeterCooldownAction), nameof(Command_TargeterCooldownAction.FireTurret), lambdaOrdinal: 0);
-                MP.RegisterSyncDelegate(typeof(Command_TargeterCooldownAction), method.DeclaringType!.Name, method.Name);
-                MpCompat.harmony.Patch(method, prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreSetTurretTarget)));
+                var targetableTurretField = AccessTools.FieldRefAccess<VehicleTurret>(method.DeclaringType, "turret");
+                MP.RegisterSyncDelegateLambda(typeof(Command_TargeterCooldownAction), nameof(Command_TargeterCooldownAction.FireTurret), 0)
+                    .SetPreInvoke((target, _) => ResetTurretTarget(targetableTurretField(target)));
 
                 // Called from Vehicles.TurretTargeter:BeginTargeting
                 PatchingUtilities.PatchCancelInInterface(AccessTools.DeclaredMethod(typeof(VehicleTurret), nameof(VehicleTurret.StartTicking)));
                 // Called from Vehicles.TurretTargeter:TargeterUpdate and Vehicles.TurretTargeter:StopTargeting(bool)
                 PatchingUtilities.PatchCancelInInterface(AccessTools.DeclaredMethod(typeof(VehicleTurret), nameof(VehicleTurret.AlignToAngleRestricted)));
                 MP.RegisterSyncMethod(typeof(VehicleTurret), nameof(VehicleTurret.CycleFireMode));
-                // Future-proofing, currently only affects the base type as the subclass doesn't override those.
+                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncSetTarget));
+                // Register overrides supplied by Vehicle Framework and vehicle add-ons.
                 foreach (var subclass in typeof(VehicleTurret).AllSubclasses().Concat(typeof(VehicleTurret)))
                 {
-                    method = AccessTools.DeclaredMethod(subclass, nameof(VehicleTurret.SetTarget));
-                    if (method != null)
-                    {
-                        // Sync the call
-                        MP.RegisterSyncMethod(method);
-                        // But only allow it to be synced under very specific circumstances
-                        MpCompat.harmony.Patch(method, prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(CancelTurretSetTargetSync)));
-                    }
-
                     // Reload has multiple overloads — sync both parameterless and (ThingDef, bool)
                     // VVE's FueledVehicleTurret.SubGizmo_ReloadFromFuel calls Reload(null, true)
                     var reloadMethod = AccessTools.DeclaredMethod(subclass, nameof(VehicleTurret.Reload), []);
@@ -242,10 +318,16 @@ namespace Multiplayer.Compat
             #region Float Menus
 
             {
-                // Enter vehicle. Can't sync through TryTakeOrderedJob, as the method does a bit more stuff.
+                // Entering a vehicle also updates Vehicle Framework state before issuing the job.
                 MpCompat.RegisterLambdaDelegate(typeof(VehiclePawn), nameof(VehiclePawn.GetFloatMenuOptions), 0);
                 // MultiplePawnFloatMenuOptions now uses OrderPawns method reference, no lambda to sync
                 // The boarding action is handled through the method reference directly.
+
+                // Multi-selection cargo commands depend on the initiating player's selection.
+                MP.RegisterSyncMethod(typeof(Command_TransferToVehicle_Order), nameof(Command_TransferToVehicle_Order.Action))
+                    .SetContext(SyncContext.MapSelected);
+                MP.RegisterSyncMethod(typeof(Command_TransferToVehicle_Cancel), nameof(Command_TransferToVehicle_Cancel.Action))
+                    .SetContext(SyncContext.MapSelected);
             }
 
             #endregion
@@ -258,14 +340,13 @@ namespace Multiplayer.Compat
                 {
                     "Vehicles.Verb_ShootRealistic:InitTurretMotes",
                     "Vehicles.VehicleTurret:InitTurretMotes",
+                    "Vehicles.CompFueledTravel:DrawMotes",
                 });
-                // Launch flecks consume game RNG during tick — isolate so launch visuals don't desync
-                // ThrowFleck has multiple overloads, patch both explicitly
-                // ThrowFleck has 3 overloads — patch all
+                // The two instance overloads choose cosmetic fleck parameters before the static
+                // overload enters Vehicle Framework's own Rand.PushState scope.
                 foreach (var throwFleck in AccessTools.GetDeclaredMethods(typeof(LaunchProtocol))
-                    .Where(m => m.Name == nameof(LaunchProtocol.ThrowFleck)))
+                    .Where(m => m.Name == nameof(LaunchProtocol.ThrowFleck) && !m.IsStatic))
                     PatchingUtilities.PatchPushPopRand(throwFleck);
-                // Vehicles.CompFueledTravel:DrawMotes - most likely not needed, RNG calls before GenView.ShouldSpawnMotesAt
             }
 
             #endregion
@@ -295,6 +376,26 @@ namespace Multiplayer.Compat
                 // Called when accepted from change color dialog
                 MpCompat.RegisterLambdaMethod("Vehicles.VehiclePawn", "ChangeColor", 0);
 
+                // Seat assignment is edited in a local dialog but consumed by caravan formation.
+                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedSetSeatAssignments));
+                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedRemoveSeatAssignments));
+                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedClearSeatAssignments));
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredMethod(typeof(VehicleAssignment), nameof(VehicleAssignment.SetAssignments)),
+                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreSetSeatAssignments)));
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredMethod(typeof(VehicleAssignment), nameof(VehicleAssignment.RemoveAssignments)),
+                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreRemoveSeatAssignments)));
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredMethod(typeof(VehicleAssignment), nameof(VehicleAssignment.Clear)),
+                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreClearSeatAssignments)));
+
+                // Stashing vehicles creates and destroys world objects from a custom transfer dialog.
+                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedStashVehicles));
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredMethod(typeof(Dialog_StashVehicle), "TransferPawns"),
+                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreStashVehicles)));
+
                 #endregion
 
                 #region Load cargo
@@ -311,9 +412,7 @@ namespace Multiplayer.Compat
                 // Setting value is changeable from load cargo dialog
                 showAllCargoItemsField = MP.RegisterSyncField(typeof(VehiclesModSettings), nameof(VehiclesModSettings.showAllCargoItems))
                     .PostApply(PostShowAllCargoItemsChanged);
-                // Since the ability to register a sync field with instance path like in mp (Type, string string),
-                // we must as a workaround provide a sync worker the Vehicle Framework settings type.
-                // Alternatively we could just call the MP method directly through reflection, but let's avoid doing that.
+                // Resolve the mod's singleton settings instance when the sync field is applied.
                 MP.RegisterSyncWorker<VehiclesModSettings>(SyncVehicleSettings);
 
                 // Capture drawing so we can tie the dialog to the session and set the correct current session with transferables.
@@ -326,9 +425,16 @@ namespace Multiplayer.Compat
                 MpCompat.harmony.Patch(AccessTools.DeclaredMethod(typeof(Dialog_LoadCargo), "SetToSendEverything"),
                     prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreLoadCargoSetToSendEverything)));
 
-                // Replace the `Widgets.ButtonText` for several buttons with our own to handle MP-specific stuff.
-                MpCompat.harmony.Patch(AccessTools.DeclaredMethod(typeof(Dialog_LoadCargo), nameof(Dialog_LoadCargo.BottomButtons)),
-                    transpiler: new HarmonyMethod(typeof(VehicleFramework), nameof(ReplaceButtonsTranspiler)));
+                // Route state-changing buttons through the synchronized cargo session using the
+                // same widget interception points as Multiplayer's own persistent dialogs.
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredMethod(typeof(Widgets), nameof(Widgets.ButtonText),
+                        [typeof(Rect), typeof(string), typeof(bool), typeof(bool), typeof(bool), typeof(TextAnchor?)]),
+                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreLoadCargoButtonText)),
+                    postfix: new HarmonyMethod(typeof(VehicleFramework), nameof(PostLoadCargoButtonText)));
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredMethod(typeof(Widgets), nameof(Widgets.ButtonTextWorker)),
+                    postfix: new HarmonyMethod(typeof(VehicleFramework), nameof(PostLoadCargoButtonTextWorker)));
 
                 // Catch load cargo dialog gizmo to open session dialog tied to it or create session if there's none
                 // Ordinal 6 = open Dialog_LoadCargo (verified from compiled DLL IL)
@@ -365,8 +471,7 @@ namespace Multiplayer.Compat
             #region ITabs and WITabs
 
             {
-                // Technically there's only 2 types here, with the type itself never used besides as a base class...
-                // May as well futureproof this, I suppose.
+                // Register the base container tab and its concrete variants.
                 foreach (var type in typeof(ITab_Airdrop_Container).AllSubclasses().Concat(typeof(ITab_Airdrop_Container)))
                 {
                     TrySyncDeclaredMethod(type, "InterfaceDrop")?.SetContext(SyncContext.MapSelected);
@@ -384,52 +489,36 @@ namespace Multiplayer.Compat
                 var typesTransferable = new[] { typeof(TransferableImmutable), typeof(AerialVehicleInFlight) };
 
                 // Abandon non-pawn Thing
-                method = MpMethodUtil.GetLambda(
+                MP.RegisterSyncDelegateLambda(
                     typeof(AerialVehicleAbandonOrBanishHelper),
                     nameof(AerialVehicleAbandonOrBanishHelper.TryAbandonOrBanishViaInterface),
-                    MethodType.Normal,
-                    typesThing,
-                    0);
-                MP.RegisterSyncDelegate(typeof(AerialVehicleAbandonOrBanishHelper), method.DeclaringType!.Name, method.Name);
-                // Abandon specific Pawn, replace the vanilla banish interaction with our synced one as
-                // syncing of the pawn fails here. All the other methods redirect pawn banishing here.
-                MpCompat.harmony.Patch(AccessTools.DeclaredMethod(
-                        typeof(AerialVehicleAbandonOrBanishHelper),
-                        nameof(AerialVehicleAbandonOrBanishHelper.TryAbandonOrBanishViaInterface),
-                        typesThing),
-                    transpiler: new HarmonyMethod(typeof(VehicleFramework), nameof(ReplaceVanillaBanishDialog)));
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedBanishPawn));
+                    0,
+                    typesThing);
+                // Pawn banishment reaches Multiplayer's existing PawnBanishUtility.Banish sync method.
 
                 // Abandon non-pawn Transferable
-                method = MpMethodUtil.GetLambda(
+                MP.RegisterSyncDelegateLambda(
                     typeof(AerialVehicleAbandonOrBanishHelper),
                     nameof(AerialVehicleAbandonOrBanishHelper.TryAbandonOrBanishViaInterface),
-                    MethodType.Normal,
-                    typesTransferable,
-                    0);
-                MP.RegisterSyncDelegate(typeof(AerialVehicleAbandonOrBanishHelper), method.DeclaringType!.Name, method.Name);
+                    0,
+                    typesTransferable);
 
                 // Abandon specific count Thing
-                method = MpMethodUtil.GetLambda(
+                MP.RegisterSyncDelegateLambda(
                     typeof(AerialVehicleAbandonOrBanishHelper),
                     nameof(AerialVehicleAbandonOrBanishHelper.TryAbandonSpecificCountViaInterface),
-                    MethodType.Normal,
-                    typesThing,
-                    0);
-                MP.RegisterSyncDelegate(typeof(AerialVehicleAbandonOrBanishHelper), method.DeclaringType!.Name, method.Name);
+                    0,
+                    typesThing);
 
                 // Abandon specific count Transferable
-                method = MpMethodUtil.GetLambda(
+                MP.RegisterSyncDelegateLambda(
                     typeof(AerialVehicleAbandonOrBanishHelper),
                     nameof(AerialVehicleAbandonOrBanishHelper.TryAbandonSpecificCountViaInterface),
-                    MethodType.Normal,
-                    typesTransferable,
-                    0);
-                MP.RegisterSyncDelegate(typeof(AerialVehicleAbandonOrBanishHelper), method.DeclaringType!.Name, method.Name);
+                    0,
+                    typesTransferable);
 
                 // CompUpgradeTree, methods called from ITab_Vehicle_Upgrades
-                // Serializer for UpgradeNode for CompUpgradeTree specifically.
-                // Making a sync worker for it would likely require iterating over each UpgradeTreeDef.
+                // Identify an upgrade node by its owning tree def and stable key.
                 var upgradeNodeSerializer = Serializer.New(
                     (UpgradeNode upgrade, object target, object[] _) => (target: ((CompUpgradeTree)target).Props.def, key: upgrade.key),
                     tuple => tuple.target.GetNode(tuple.key)
@@ -450,6 +539,10 @@ namespace Multiplayer.Compat
                 MP.RegisterSyncMethod(typeof(CompUpgradeTree), nameof(CompUpgradeTree.ResetUnlock))
                     .TransformArgument(0, upgradeNodeSerializer)
                     .SetDebugOnly();
+
+                // Per-turret ammunition enablement and reload quotas.
+                MP.RegisterSyncMethod(typeof(AutoLoadConfig), nameof(AutoLoadConfig.SetEnabled));
+                MP.RegisterSyncMethod(typeof(AutoLoadConfig), nameof(AutoLoadConfig.Set));
             }
 
             #endregion
@@ -457,45 +550,21 @@ namespace Multiplayer.Compat
             #region Flying vehicles
 
             {
-                    MP.RegisterSyncWorker<LaunchProtocol>(SyncLaunchProtocol, isImplicit: true);
+                MP.RegisterSyncWorker<LaunchProtocol>(SyncLaunchProtocol, isImplicit: true);
                 MP.RegisterSyncWorker<FlightNode>(SyncFlightNode);
-                MP.RegisterSyncWorker<VehicleArrivalAction>(SyncVehicleArrivalAction, isImplicit: true);
-                // Launch parameter type is IArrivalAction (interface), not VehicleArrivalAction (base class)
-                MP.RegisterSyncWorker<IArrivalAction>(SyncIArrivalAction, isImplicit: true);
+                MP.RegisterSyncWorker<SmashTools.Targeting.TargetData<GlobalTargetInfo>>(SyncGlobalTargetData);
 
-                // Sync launch via prefix → static sync method to avoid ThingComp serialization.
-                // MP's ThingComp reader has a bug: if the parent Thing resolves to null, it
-                // returns without reading the compIndex ushort, misaligning all subsequent reads.
-                // By using a static sync method with the vehicle as a plain Thing arg, we avoid
-                // the ThingComp serializer entirely.
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedLaunch));
-                MpCompat.harmony.Patch(
-                    AccessTools.DeclaredMethod(typeof(CompVehicleLauncher), nameof(CompVehicleLauncher.Launch)),
-                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreLaunch)));
-
-                // Sync OrderFlyToTiles via prefix → static sync method for consistency
-                // and to set the arrival action vehicle reference before execution.
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedOrderFlyToTiles));
-                MpCompat.harmony.Patch(
-                    AccessTools.DeclaredMethod(typeof(AerialVehicleInFlight), nameof(AerialVehicleInFlight.OrderFlyToTiles)),
-                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreOrderFlyToTiles)));
-
-                // Sync VehicleCaravan.Launch — it creates AerialVehicleInFlight AND calls
-                // OrderFlyToTiles. Both must happen atomically during sync execution,
-                // otherwise the world object only exists on the originating player.
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedCaravanLaunch));
-                MpCompat.harmony.Patch(
-                    AccessTools.DeclaredMethod(typeof(VehicleCaravan), nameof(VehicleCaravan.Launch)),
-                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreCaravanLaunch)));
-
-                // Sync StartTargetingLocalMap for the non-spawned case (caravan on world map).
-                // When selecting "land in existing map", the flow bypasses VehicleCaravan.Launch
-                // and calls StartTargetingLocalMap directly, which creates AerialVehicleInFlight
-                // + OrderFlyToTiles. Must be synced atomically like caravan launch.
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedWorldVehicleFlyToMap));
-                MpCompat.harmony.Patch(
-                    AccessTools.DeclaredMethod(typeof(LaunchProtocol), nameof(LaunchProtocol.StartTargetingLocalMap)),
-                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreStartTargetingLocalMap)));
+                MP.RegisterSyncMethod(typeof(CompVehicleLauncher), nameof(CompVehicleLauncher.Launch))
+                    .ExposeParameter(1)
+                    .SetPreInvoke(SetLaunchArrivalVehicle);
+                MP.RegisterSyncMethod(typeof(AerialVehicleInFlight), nameof(AerialVehicleInFlight.OrderFlyToTiles))
+                    .ExposeParameter(1)
+                    .SetPreInvoke(SetOrderArrivalVehicle);
+                MP.RegisterSyncMethod(typeof(VehicleCaravan), nameof(VehicleCaravan.Launch))
+                    .ExposeParameter(1)
+                    .SetPreInvoke(SetCaravanLaunchArrivalVehicle)
+                    .SetPostInvoke(CleanupDestroyedCaravanAfterLaunch);
+                MP.RegisterSyncMethod(typeof(LaunchProtocol), nameof(LaunchProtocol.StartTargetingLocalMap));
 
                 // VF bug: VehicleSkyfaller_Leaving.ExposeData doesn't save arrivalAction.
                 // In MP, saves can happen between skyfaller creation and LeaveMap, losing the action.
@@ -503,8 +572,7 @@ namespace Multiplayer.Compat
                     AccessTools.DeclaredMethod(typeof(VehicleSkyfaller_Leaving), nameof(VehicleSkyfaller_Leaving.ExposeData)),
                     postfix: new HarmonyMethod(typeof(VehicleFramework), nameof(PostSkyfallerLeavingExposeData)));
 
-                // Ensure arrival action has the vehicle reference set during sync execution.
-                // These prefixes run when Launch/OrderFlyToTiles execute inside the synced wrappers.
+                // Also repair actions restored from a save before they enter the synced action path.
                 MpCompat.harmony.Patch(
                     AccessTools.DeclaredMethod(typeof(CompVehicleLauncher), nameof(CompVehicleLauncher.Launch)),
                     prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreLaunchSetArrivalVehicle)));
@@ -526,10 +594,6 @@ namespace Multiplayer.Compat
                     AccessTools.DeclaredMethod(typeof(AerialVehicleInFlight), "ResumePathPostLoad"),
                     prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreResumePathPostLoad)),
                     postfix: new HarmonyMethod(typeof(VehicleFramework), nameof(PostResumePathPostLoad)));
-
-                // Deselect destroyed vehicle caravans and pick their respective aerial vehicles (if there are any).
-                MpCompat.harmony.Patch(AccessTools.DeclaredMethod(typeof(VehicleCaravan), nameof(VehicleCaravan.GetInspectString)),
-                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(CleanupDestroyedCaravans)));
 
                 // Aerial vehicles have multiple arrival actions at settlements
                 // and the like. This specific ones orders the vehicle to fly to
@@ -555,53 +619,15 @@ namespace Multiplayer.Compat
             #region SyncWorkers
 
             {
-                // Special sync for vehicle pawn and some of its comps in case it's currently held by flying vehicle
-                MP.RegisterSyncWorker<VehiclePawn>(SyncVehiclePawn, isImplicit: true);
-                MP.RegisterSyncWorker<CompFueledTravel>(SyncFueledTravelComp);
-                // ITabs
-                MP.RegisterSyncWorker<object>(NoSync, typeof(ITab_Vehicle_Cargo), shouldConstruct: true);
+                MP.RegisterSyncWorker<Gizmo_RefuelableFuelTravel>(SyncFuelGizmo);
                 // Turret
                 MP.RegisterSyncWorker<Command_Turret>(SyncCommandTurret, typeof(Command_Turret), true, true);
                 // Vehicle pawn elements
                 MP.RegisterSyncWorker<VehicleComponent>(SyncVehicleComponent, isImplicit: true);
                 MP.RegisterSyncWorker<VehicleTurret>(SyncVehicleTurret, isImplicit: true);
+                MP.RegisterSyncWorker<AutoLoadConfig>(SyncAutoLoadConfig, isImplicit: true);
                 MP.RegisterSyncWorker<VehicleIgnitionController>(SyncVehicleIgnitionController);
                 MP.RegisterSyncWorker<VehicleRoleHandler>(SyncVehicleRoleHandler);
-                // Caravan forming
-                MP.RegisterSyncWorker<AssignedSeat>(SyncAssignedSeat);
-            }
-
-            #endregion
-
-            #region Multiplayer
-
-            {
-                // Get the type of MpTransferableReference, as we'll have to initialize it in a few places. 
-                mpTransferableReferenceType = AccessTools.TypeByName("Multiplayer.Client.Persistent.MpTransferableReference");
-                // We could alternatively register our own ISyncField, but then we'd have to also make PostApply,
-                // which would require referencing more stuff from MP itself. Seemed easier to just re-use the ready ISyncField.
-                syncTradeableCount = (ISyncField)AccessTools.DeclaredField("Multiplayer.Client.SyncFields:SyncTradeableCount").GetValue(null);
-
-                // Insert VehicleRoleHandler as supported thing holder for syncing.
-                // The mod uses VehicleRoleHandler as IThingHolder and ends up being synced.
-                // We should add support for adding more supported thing holders soon... I think the PokéWorld mod would benefit from it as well.
-                const string supportedThingHoldersFieldPath = "Multiplayer.Client.RwSerialization:supportedThingHolders";
-                var supportedThingHoldersField = AccessTools.DeclaredField(supportedThingHoldersFieldPath);
-                if (supportedThingHoldersField == null)
-                    Log.Error($"Trying to access {supportedThingHoldersFieldPath} failed, field is null.");
-                else if (!supportedThingHoldersField.IsStatic)
-                    Log.Error($"Trying to access {supportedThingHoldersFieldPath} failed, field is non-static.");
-                else if (supportedThingHoldersField.GetValue(null) is not Type[] array)
-                    Log.Error($"Trying to access {supportedThingHoldersFieldPath} failed, the value is null or not Type[]. Value={supportedThingHoldersField.GetValue(null)}");
-                else
-                {
-                    // Increase size by 1
-                    Array.Resize(ref array, array.Length + 1);
-                    // Fill the last element
-                    array[array.Length - 1] = typeof(VehicleRoleHandler);
-                    // Set the original field to the value we set up
-                    supportedThingHoldersField.SetValue(null, array);
-                }
             }
 
             #endregion
@@ -615,114 +641,238 @@ namespace Multiplayer.Compat
 
         #region Disable multithreading
 
-        // Stops specific threads from being created
-        private static bool NoThreadInMp(VehiclePathingSystem mapping) => !MP.IsInMultiplayer && mapping.ThreadAvailable;
+        private static void DisableVehiclePathingThreadsInMultiplayer(ref bool __result)
+            => __result &= !MP.IsInMultiplayer;
 
-        private static IEnumerable<CodeInstruction> ReplaceThreadAvailable(IEnumerable<CodeInstruction> instr, MethodBase baseMethod)
+        [MpCompatPrefix(typeof(VehiclePathingSystem), nameof(VehiclePathingSystem.MapComponentTick))]
+        private static void StopExistingVehiclePathingThread(VehiclePathingSystem __instance)
         {
-            var target = AccessTools.DeclaredPropertyGetter(typeof(VehiclePathingSystem), nameof(VehiclePathingSystem.ThreadAvailable));
-            var replacement = AccessTools.DeclaredMethod(typeof(VehicleFramework), nameof(NoThreadInMp));
-            var replacedAnything = false;
+            if (MP.IsInMultiplayer && __instance.ThreadAlive)
+                __instance.ReleaseThread();
+        }
 
-            foreach (var ci in instr)
-            {
-                if (ci.Calls(target))
-                {
-                    ci.opcode = OpCodes.Call;
-                    ci.operand = replacement;
-                    replacedAnything = true;
-                }
+        [MpCompatTranspiler(typeof(VehiclePathFollower), nameof(VehiclePathFollower.RequestNewPath))]
+        [MpCompatTranspiler(typeof(WorldVehiclePathGrid), "RecalculateAllPathCostsAsync")]
+        [MpCompatTranspiler(typeof(WorldVehiclePathGrid), "RecalculateReachabilityGrid")]
+        private static IEnumerable<CodeInstruction> RunVehiclePathfindingSynchronously(
+            IEnumerable<CodeInstruction> instr,
+            MethodBase baseMethod)
+        {
+            var target = AccessTools.DeclaredMethod(
+                typeof(TaskManager),
+                nameof(TaskManager.Run),
+                [typeof(Action), typeof(CancellationToken)]);
+            var replacement = MpMethodUtil.MethodOf(RunVehiclePathAction);
 
-                yield return ci;
-            }
+            return instr.ReplaceMethod(target, replacement, baseMethod, expectedReplacements: 1);
+        }
 
-            if (!replacedAnything)
-            {
-                var name = (baseMethod.DeclaringType?.Namespace).NullOrEmpty() ? baseMethod.Name : $"{baseMethod.DeclaringType!.Name}:{baseMethod.Name}";
-                Log.Warning($"Failed to patch {nameof(VehiclePathingSystem)}.{nameof(VehiclePathingSystem.ThreadAvailable)} calls for method {name}");
-            }
+        private static Task RunVehiclePathAction(Action action, CancellationToken token)
+        {
+            if (!MP.IsInMultiplayer)
+                return TaskManager.Run(action, token);
+
+            if (!token.IsCancellationRequested)
+                action();
+
+            return Task.CompletedTask;
         }
 
         #endregion
 
         #endregion
 
-        #region Fuel toggle sync
+        #region Vehicle jobs
 
-        private static bool PreToggleFuelSwitch(Gizmo_RefuelableFuelTravel __instance)
+        [MpCompatPrefix(typeof(JobDriver_IdleVehicle), "MakeNewToils")]
+        private static void RestoreMissingIdleVehicleTarget(JobDriver_IdleVehicle __instance)
         {
-            if (!MP.IsInMultiplayer)
+            if (MP.IsInMultiplayer && !__instance.job.targetA.IsValid)
+                __instance.job.targetA = __instance.pawn;
+        }
+
+        #endregion
+
+        #region Caravan seat assignment sync
+
+        private static bool RedirectVehicleCaravanForceDeparture(Lord lord)
+        {
+            if (!MP.IsInMultiplayer || lord?.LordJob is not LordJob_FormAndSendVehicles vehicleJob)
                 return true;
 
-            SyncedToggleFuelSwitch(fuelGizmoRefuelableField(__instance));
+            vehicleJob.ForceCaravanLeave();
             return false;
         }
 
-        private static void SyncedToggleFuelSwitch(CompFueledTravel comp)
+        private static bool PreSetSeatAssignments(VehicleAssignment __instance, VehiclePawn vehicle, List<AssignedSeat> assignments)
         {
-            if (comp.Props.ElectricPowered)
-            {
-                if (!comp.Charging)
-                {
-                    if (comp.TryConnectPower())
-                        SoundDefOf.Tick_High.PlayOneShotOnCamera();
-                    else
-                        SoundDefOf.ClickReject.PlayOneShotOnCamera();
-                }
-                else
-                {
-                    comp.DisconnectPower();
-                    SoundDefOf.Tick_Low.PlayOneShotOnCamera();
-                }
-            }
-            else
-            {
-                comp.allowAutoRefuel = !comp.allowAutoRefuel;
-                (comp.allowAutoRefuel ? SoundDefOf.Tick_High : SoundDefOf.Tick_Low).PlayOneShotOnCamera();
-            }
-        }
-
-        #endregion
-
-        #region Disembark pawn sync
-
-        private static bool PreDisembarkSinglePawn(object __instance)
-        {
-            if (!MP.IsInMultiplayer)
+            if (!ShouldSyncCaravanSeatAssignment(__instance))
                 return true;
 
-            // __instance is DisplayClass291_1 which has:
-            //   currentPawn (Pawn) and CS$<>8__locals1 (DisplayClass291_0)
-            // DisplayClass291_0 has <>4__this (VehiclePawn)
-            var pawnField = __instance.GetType().GetField("currentPawn");
-            var parentField = __instance.GetType().GetField("CS$<>8__locals1")
-                           ?? __instance.GetType().GetField("CS$<>8__locals2");
-            var parent = parentField?.GetValue(__instance);
-            var vehicleField = parent?.GetType().GetField("<>4__this");
-
-            if (vehicleField?.GetValue(parent) is VehiclePawn vehicle &&
-                pawnField?.GetValue(__instance) is Pawn pawn)
-            {
-                SyncedDisembarkPawn(vehicle, pawn.thingIDNumber);
-            }
-
+            SyncedSetSeatAssignments(
+                vehicle,
+                assignments.Select(assignment => assignment.pawn).ToList(),
+                assignments.Select(assignment => assignment.handler).ToList());
             return false;
         }
 
-        private static void SyncedDisembarkPawn(VehiclePawn vehicle, int pawnId)
+        private static void SyncedSetSeatAssignments(
+            VehiclePawn vehicle,
+            List<Pawn> pawns,
+            List<VehicleRoleHandler> handlers)
         {
-            // Find the pawn inside the vehicle's handlers
-            foreach (var handler in vehicle.handlers)
+            if (vehicle == null || pawns == null || handlers == null || pawns.Count != handlers.Count)
+                return;
+
+            var previouslyAssignedPawns = CaravanHelper.assignedSeats.GetAssignments(vehicle)
+                .Select(assignment => assignment.pawn)
+                .ToList();
+            var assignments = new List<AssignedSeat>();
+            for (var i = 0; i < pawns.Count; i++)
             {
-                foreach (var thing in handler.thingOwner.InnerListForReading)
+                var pawn = pawns[i];
+                var handler = handlers[i];
+                if (pawn != null && handler?.vehicle == vehicle)
+                    assignments.Add(new AssignedSeat(pawn, handler));
+            }
+
+            var session = GetCaravanFormingSession(vehicle.Map);
+            foreach (var pawn in previouslyAssignedPawns)
+                SetCaravanFormingTransferCount(session, pawn, 0);
+            foreach (var pawn in assignments.Select(assignment => assignment.pawn))
+                SetCaravanFormingTransferCount(session, pawn, 1);
+
+            CaravanHelper.assignedSeats.SetAssignments(vehicle, assignments);
+
+            var vehicleTransferable = session?.GetTransferableByThingId(vehicle.thingIDNumber);
+            if (vehicleTransferable != null)
+            {
+                vehicleTransferable.AdjustTo(assignments.Count > 0 ? vehicleTransferable.GetMaximumToTransfer() : 0);
+                session.Notify_CountChanged(vehicleTransferable);
+            }
+        }
+
+        private static bool PreRemoveSeatAssignments(VehicleAssignment __instance, VehiclePawn vehicle)
+        {
+            if (!ShouldSyncCaravanSeatAssignment(__instance))
+                return true;
+
+            SyncedRemoveSeatAssignments(vehicle);
+            return false;
+        }
+
+        private static void SyncedRemoveSeatAssignments(VehiclePawn vehicle)
+        {
+            if (vehicle == null)
+                return;
+
+            var previouslyAssignedPawns = CaravanHelper.assignedSeats.GetAssignments(vehicle)
+                .Select(assignment => assignment.pawn)
+                .ToList();
+
+            var session = GetCaravanFormingSession(vehicle.Map);
+            SetCaravanFormingTransferCount(session, vehicle, 0);
+            foreach (var pawn in previouslyAssignedPawns.Where(pawn => pawn != null && !pawn.InVehicle()))
+                SetCaravanFormingTransferCount(session, pawn, 0);
+            foreach (var pawn in vehicle.AllPawnsAboard)
+                SetCaravanFormingTransferCount(session, pawn, 0);
+
+            CaravanHelper.assignedSeats.RemoveAssignments(vehicle);
+        }
+
+        private static bool PreClearSeatAssignments(VehicleAssignment __instance)
+        {
+            if (!ShouldSyncCaravanSeatAssignment(__instance))
+                return true;
+
+            SyncedClearSeatAssignments();
+            return false;
+        }
+
+        private static void SyncedClearSeatAssignments()
+            => CaravanHelper.assignedSeats.Clear();
+
+        private static ISessionWithTransferables GetCaravanFormingSession(Map map)
+            => map == null || caravanFormingSessionType == null
+                ? null
+                : MP.GetLocalSessionManager(map).AllSessions
+                    .FirstOrDefault(caravanFormingSessionType.IsInstanceOfType) as ISessionWithTransferables;
+
+        private static void SetCaravanFormingTransferCount(ISessionWithTransferables session, Thing thing, int count)
+        {
+            var transferable = thing == null ? null : session?.GetTransferableByThingId(thing.thingIDNumber);
+            if (transferable == null)
+                return;
+
+            transferable.ForceTo(count);
+            session.Notify_CountChanged(transferable);
+        }
+
+        private static bool ShouldSyncCaravanSeatAssignment(VehicleAssignment assignment)
+            => MP.IsInMultiplayer
+               && MP.InInterface
+               && !MP.IsExecutingSyncCommand
+               && ReferenceEquals(assignment, CaravanHelper.assignedSeats);
+
+        #endregion
+
+        #region Stash vehicle sync
+
+        private static bool PreStashVehicles(Dialog_StashVehicle __instance, ref bool __result)
+        {
+            if (!MP.IsInMultiplayer || MP.IsExecutingSyncCommand)
+                return true;
+
+            var things = new List<Thing>();
+            var groupSizes = new List<int>();
+            var counts = new List<int>();
+
+            foreach (var transferable in __instance.transferables)
+            {
+                if (transferable.CountToTransfer <= 0)
+                    continue;
+
+                groupSizes.Add(transferable.things.Count);
+                counts.Add(transferable.CountToTransfer);
+                things.AddRange(transferable.things);
+            }
+
+            SyncedStashVehicles(__instance.caravan, things, groupSizes, counts);
+            __result = true;
+            return false;
+        }
+
+        private static void SyncedStashVehicles(
+            VehicleCaravan caravan,
+            List<Thing> things,
+            List<int> groupSizes,
+            List<int> counts)
+        {
+            if (caravan == null || things == null || groupSizes == null || counts == null ||
+                groupSizes.Count != counts.Count || groupSizes.Sum() != things.Count)
+                return;
+
+            var transferables = new List<TransferableOneWay>();
+            var thingIndex = 0;
+
+            for (var groupIndex = 0; groupIndex < groupSizes.Count; groupIndex++)
+            {
+                var transferable = new TransferableOneWay();
+                for (var i = 0; i < groupSizes[groupIndex]; i++, thingIndex++)
                 {
-                    if (thing.thingIDNumber == pawnId && thing is Pawn pawn)
-                    {
-                        vehicle.DisembarkPawn(pawn);
-                        return;
-                    }
+                    var thing = things[thingIndex];
+                    if (thing != null)
+                        transferable.things.Add(thing);
+                }
+
+                if (transferable.things.Count > 0)
+                {
+                    transferable.AdjustTo(counts[groupIndex]);
+                    transferables.Add(transferable);
                 }
             }
+
+            StashedVehicle.Create(caravan, out _, transferables);
         }
 
         #endregion
@@ -777,98 +927,157 @@ namespace Multiplayer.Compat
             }
         }
 
-        private static void ReplacedShowBanishPawnConfirmationDialog(Pawn pawn, Action onConfirm, AerialVehicleInFlight aerialVehicle)
-        {
-            if (!MP.IsInMultiplayer)
-            {
-                PawnBanishUtility.ShowBanishPawnConfirmationDialog(pawn, onConfirm);
-                return;
-            }
-
-            // onConfirm should be null, don't bother with it in MP
-            if (onConfirm != null)
-                Log.ErrorOnce($"onConfirm was not null for {nameof(PawnBanishUtility.ShowBanishPawnConfirmationDialog)}, MP Compat will likely need an update. There may be issues", -818484805);
-
-            Find.WindowStack.Add(Dialog_MessageBox.CreateConfirmation(
-                PawnBanishUtility.GetBanishPawnDialogText(pawn),
-                () => SyncedBanishPawn(aerialVehicle, pawn.thingIDNumber),
-                true));
-        }
-
-        private static void SyncedBanishPawn(AerialVehicleInFlight aerialVehicle, int pawnId)
-        {
-            if (aerialVehicle?.vehicle == null)
-                return;
-
-            var pawns = aerialVehicle.vehicle.AllPawnsAboard;
-            if (pawns.NullOrEmpty())
-                return;
-
-            var pawn = pawns.Find(p => p.thingIDNumber == pawnId);
-            if (pawn != null)
-                PawnBanishUtility.Banish(pawn);
-        }
-
-        private static IEnumerable<CodeInstruction> ReplaceVanillaBanishDialog(IEnumerable<CodeInstruction> instr, MethodBase baseMethod)
-        {
-            var target = AccessTools.DeclaredMethod(typeof(PawnBanishUtility), nameof(PawnBanishUtility.ShowBanishPawnConfirmationDialog));
-            var replacement = AccessTools.DeclaredMethod(typeof(VehicleFramework), nameof(ReplacedShowBanishPawnConfirmationDialog));
-            var replacedCount = 0;
-
-            foreach (var ci in instr)
-            {
-                if (ci.Calls(target))
-                {
-                    ci.opcode = OpCodes.Call;
-                    ci.operand = replacement;
-
-                    replacedCount++;
-
-                    // Load the first arg (AerialVehicleInFlight) to the stack so our replacement method can access it
-                    yield return new CodeInstruction(OpCodes.Ldarg_1);
-                }
-
-                yield return ci;
-            }
-
-            const int expected = 1;
-            if (replacedCount != expected)
-            {
-                var name = (baseMethod.DeclaringType?.Namespace).NullOrEmpty() ? baseMethod.Name : $"{baseMethod.DeclaringType!.Name}:{baseMethod.Name}";
-                Log.Warning($"Patched incorrect number of PawnBanishUtility.ShowBanishPawnConfirmationDialog calls (patched {replacedCount}, expected {expected}) for method {name}");
-            }
-#if DEBUG
-            else
-            {
-                var name = (baseMethod.DeclaringType?.Namespace).NullOrEmpty() ? baseMethod.Name : $"{baseMethod.DeclaringType!.Name}:{baseMethod.Name}";
-                Log.Message($"Patched PawnBanishUtility.ShowBanishPawnConfirmationDialog calls (patched {replacedCount}, expected {expected}) for method {name}");
-            }
-#endif
-        }
-
         #endregion
 
-        #region Turrets
-
-        // In almost every situation that `SetTarget` is called, we want to cancel it in interface.
-        // This is due to the `SetTarget` being called with intent to make the turret start following
-        // the current mouse position, which we don't want, and it's a feature we've disabled in MP.
-        // There's however only 1 situation that it's not the case, this will handle it.
-        // The situation is pressing the gizmo's cancel button to stop targetting att all.
-        private static bool CancelTurretSetTargetSync() => shouldSyncInInterface || !MP.InInterface;
-
-        private static void SyncSetTarget(VehicleTurret turret, LocalTargetInfo target)
+        private static void PrepareVehicleTabsForCaravanFormingProxy(
+            Dialog_FormCaravan formCaravan,
+            List<TabRecord> tabsList,
+            ref bool thisWindowInstanceEverOpened)
         {
+            if (MP.IsInMultiplayer &&
+                caravanFormingProxyType.IsInstanceOfType(formCaravan) &&
+                tabsList.Count == 0)
+                thisWindowInstanceEverOpened = false;
+        }
+
+        [MpCompatPostfix(typeof(VehicleRoutePlanner), nameof(VehicleRoutePlanner.ShouldStop), methodType: MethodType.Getter)]
+        private static void KeepVehicleRoutePlannerOpen(VehicleRoutePlanner __instance, ref bool __result)
+        {
+            if (MP.IsInMultiplayer && __result && __instance.IsActive && WorldRendererUtility.WorldSelected)
+                __result = false;
+        }
+
+        private static bool SyncVehicleCaravanRoute(PlanetTile tile)
+        {
+            if (!MP.IsInMultiplayer || !MP.InInterface)
+                return true;
+
+            var formation = CaravanFormation.formation;
+            if (formation == null ||
+                !caravanFormingProxyType.IsInstanceOfType(formation.Dialog) ||
+                !tile.Valid)
+                return true;
+
+            var vehicles = TransferableUtility.GetPawnsFromTransferables(formation.Dialog.transferables)
+                .OfType<VehiclePawn>()
+                .ToList();
+            if (vehicles.Count == 0)
+                return true;
+
+            PlanetTile startingTile;
+            Rand.PushState();
             try
             {
-                shouldSyncInInterface = true;
-                turret.SetTarget(target);
+                startingTile = CaravanHelper.BestExitTileToGoTo(
+                    vehicles.Select(vehicle => vehicle.VehicleDef).Distinct().ToList(),
+                    tile,
+                    formation.Map);
             }
             finally
             {
-                shouldSyncInInterface = false;
+                Rand.PopState();
+            }
+
+            SyncedChooseVehicleCaravanRoute(formation.Map, tile, startingTile);
+            return false;
+        }
+
+        private static void SyncedChooseVehicleCaravanRoute(
+            Map map,
+            PlanetTile destinationTile,
+            PlanetTile startingTile)
+        {
+            var session = GetCaravanFormingSession(map);
+            if (session == null)
+                return;
+
+            synchronizedVehicleStartingTile = startingTile;
+            try
+            {
+                caravanFormingChooseRouteMethod.Invoke(session, new object[] { destinationTile });
+            }
+            finally
+            {
+                synchronizedVehicleStartingTile = PlanetTile.Invalid;
             }
         }
+
+        private static IEnumerable<CodeInstruction> UseSynchronizedVehicleStartingTile(
+            IEnumerable<CodeInstruction> instr,
+            MethodBase baseMethod)
+        {
+            var target = AccessTools.DeclaredMethod(
+                typeof(CaravanExitMapUtility),
+                nameof(CaravanExitMapUtility.BestExitTileToGoTo),
+                [typeof(PlanetTile), typeof(Map)]);
+            var replacement = MpMethodUtil.MethodOf(GetSynchronizedVehicleStartingTile);
+
+            return instr.ReplaceMethod(target, replacement, baseMethod, expectedReplacements: 1);
+        }
+
+        private static PlanetTile GetSynchronizedVehicleStartingTile(
+            PlanetTile destinationTile,
+            Map map)
+            => MP.IsInMultiplayer &&
+               MP.IsExecutingSyncCommand &&
+               synchronizedVehicleStartingTile.Valid
+                ? synchronizedVehicleStartingTile
+                : CaravanExitMapUtility.BestExitTileToGoTo(destinationTile, map);
+
+        private static void ResetVehicleEdgeCellCache(ref List<IntVec3> ___mapEdgeCells)
+        {
+            if (MP.IsInMultiplayer)
+                ___mapEdgeCells = null;
+        }
+
+        private static bool RedirectVehicleCaravanSendToSession(ref bool __result)
+        {
+            if (!MP.IsInMultiplayer || !MP.InInterface || MP.IsExecutingSyncCommand)
+                return true;
+
+            var session = GetCaravanFormingSession(CaravanFormation.formation?.Map);
+            if (session == null)
+                return true;
+
+            caravanFormingTrySendMethod.Invoke(session, null);
+            // The synchronized session removes itself only when VF's formation succeeds. Keep the
+            // proxy open until then so a validation failure neither closes the UI nor clears seats.
+            __result = false;
+            return false;
+        }
+
+        private static bool FormVehicleCaravanFromSessionDummy(Dialog_FormCaravan __instance, ref bool __result)
+        {
+            if (!MP.IsInMultiplayer || !MP.IsExecutingSyncCommand)
+                return true;
+
+            var vehicle = __instance.transferables?
+                .FirstOrDefault(transferable => transferable.CountToTransfer > 0 && transferable.AnyThing is VehiclePawn)?
+                .AnyThing as VehiclePawn;
+            if (vehicle?.Map == null)
+                return true;
+
+            var previousFormation = CaravanFormation.formation;
+            try
+            {
+                CaravanFormation.formation = new FormationInfo(__instance, vehicle.Map);
+                // The outer VF method normally prepares these lists before reaching this final
+                // function. We intentionally bypass the outer UI warnings during synchronized
+                // execution, so perform the same VF-owned recache explicitly on the session dummy.
+                CaravanFormation.formation.RecacheTransferables();
+                __result = (bool)vehicleTryFormAndSendMethod.Invoke(null, null);
+                return false;
+            }
+            finally
+            {
+                CaravanFormation.formation = previousFormation;
+            }
+        }
+
+        #region Turrets
+
+        private static void SyncSetTarget(VehicleTurret turret, LocalTargetInfo target)
+            => turret.SetTarget(target);
 
         private static IEnumerable<CodeInstruction> ReplaceSetTargetCall(IEnumerable<CodeInstruction> instr, MethodBase baseMethod)
         {
@@ -898,79 +1107,50 @@ namespace Multiplayer.Compat
         }
 
         // Normally, a turret would start warmup once it starts pointing at the target.
-        // In MP, as we cancel the set target earlier when starting targetting, it
-        // doesn't properly reset the target and the vehicle thinks it's already targetting
-        // and starts the warmup instantly. This should fix that issue by forcing the turret
-        // to recalculate the position it should be aiming at before it starts aiming.
-        private static void PreSetTurretTarget(VehicleTurret ___turret)
+        // Starting the local targeter skips Vehicle Framework's target reset. Reset and realign
+        // before the synchronized target is applied so the turret does not begin warmup early.
+        private static void ResetTurretTarget(VehicleTurret turret)
         {
-            if (!MP.IsInMultiplayer)
+            if (turret == null)
                 return;
 
             // Only needed for the first shot. All the other ones would be fine without it.
-            ___turret.SetTarget(LocalTargetInfo.Invalid);
-            // Actually force the turret to recalculate stuff.
-            ___turret.AlignToAngleRestricted(0f);
+            turret.SetTarget(LocalTargetInfo.Invalid);
+            turret.AlignToAngleRestricted(0f);
         }
 
         #endregion
 
         #region Flying Vehicles
 
-        private static bool PreLaunch(CompVehicleLauncher __instance,
-            SmashTools.Targeting.TargetData<GlobalTargetInfo> targetData, IArrivalAction arrivalAction)
+        private static void SetLaunchArrivalVehicle(object target, object[] args)
         {
-            if (!MP.IsInMultiplayer || MP.IsExecutingSyncCommand)
-                return true;
-
-            ExtractTargetData(targetData.targets, out var tileIds, out var layerIds, out var worldObjectIds);
-            SyncedLaunch(__instance.Vehicle, tileIds, layerIds, worldObjectIds, (VehicleArrivalAction)arrivalAction);
-            return false;
+            if (target is CompVehicleLauncher launcher && args.Length > 1)
+                SetArrivalActionVehicle(args[1] as IArrivalAction, launcher.Vehicle);
         }
 
-        private static void SyncedLaunch(VehiclePawn vehicle, List<int> tileIds, List<int> layerIds, List<int> worldObjectIds, VehicleArrivalAction arrivalAction)
+        private static void SetOrderArrivalVehicle(object target, object[] args)
         {
-            if (arrivalAction != null)
-                arrivalActionVehicleField(arrivalAction) = vehicle;
-            vehicle.CompVehicleLauncher.Launch(ReconstructTargetData(tileIds, layerIds, worldObjectIds), arrivalAction);
+            if (target is AerialVehicleInFlight aerialVehicle && args.Length > 1)
+                SetArrivalActionVehicle(args[1] as IArrivalAction, aerialVehicle.vehicle);
         }
 
-        private static bool PreCaravanLaunch(VehicleCaravan __instance,
-            SmashTools.Targeting.TargetData<GlobalTargetInfo> targetData, IArrivalAction arrivalAction)
+        private static void SetCaravanLaunchArrivalVehicle(object target, object[] args)
         {
-            if (!MP.IsInMultiplayer || MP.IsExecutingSyncCommand)
-                return true;
-
-            ExtractTargetData(targetData.targets, out var tileIds, out var layerIds, out var worldObjectIds);
-            SyncedCaravanLaunch(__instance, tileIds, layerIds, worldObjectIds, (VehicleArrivalAction)arrivalAction);
-            return false;
+            if (target is VehicleCaravan caravan && args.Length > 1)
+                SetArrivalActionVehicle(args[1] as IArrivalAction, caravan.LeadVehicle);
         }
 
-        private static void SyncedCaravanLaunch(VehicleCaravan caravan, List<int> tileIds, List<int> layerIds, List<int> worldObjectIds, VehicleArrivalAction arrivalAction)
+        private static void SetArrivalActionVehicle(IArrivalAction arrivalAction, VehiclePawn vehicle)
         {
-            if (arrivalAction != null)
-                arrivalActionVehicleField(arrivalAction) = caravan.LeadVehicle;
-            caravan.Launch(ReconstructTargetData(tileIds, layerIds, worldObjectIds), arrivalAction);
+            if (arrivalAction is VehicleArrivalAction vehicleAction)
+                vehicleAction.vehicle = vehicle;
         }
 
-        private static bool PreStartTargetingLocalMap(VehiclePawn vehicle,
-            SmashTools.Targeting.TargetData<GlobalTargetInfo> targetData,
-            MapParent mapParent, LocalTargetInfo landingCell, Rot4 rot)
+        private static void CleanupDestroyedCaravanAfterLaunch(object target, object[] _)
         {
-            if (!MP.IsInMultiplayer || MP.IsExecutingSyncCommand)
-                return true;
-
-            // Sync the entire StartTargetingLocalMap call atomically for both spawned
-            // and non-spawned cases. The arrival action (ArrivalAction_LandToCell) needs
-            // mapParent/landingCell/rot which SyncVehicleArrivalAction can't serialize.
-            ExtractTargetData(targetData.targets, out var tileIds, out var layerIds, out var worldObjectIds);
-            SyncedWorldVehicleFlyToMap(vehicle, tileIds, layerIds, worldObjectIds, mapParent, landingCell.Cell, rot);
-            return false;
-        }
-
-        private static void SyncedWorldVehicleFlyToMap(VehiclePawn vehicle, List<int> tileIds, List<int> layerIds, List<int> worldObjectIds, MapParent mapParent, IntVec3 landingCell, Rot4 rot)
-        {
-            LaunchProtocol.StartTargetingLocalMap(vehicle, ReconstructTargetData(tileIds, layerIds, worldObjectIds), mapParent, landingCell, rot);
+            if (MP.IsExecutingSyncCommandIssuedBySelf && target is VehicleCaravan { Destroyed: true } caravan)
+                Find.WorldSelector.Deselect(caravan);
         }
 
         private static void PostSkyfallerLeavingExposeData(VehicleSkyfaller_Leaving __instance)
@@ -982,125 +1162,29 @@ namespace Multiplayer.Compat
 
         private static void PreLaunchSetArrivalVehicle(CompVehicleLauncher __instance, IArrivalAction arrivalAction)
         {
-            if (MP.IsInMultiplayer && arrivalAction is VehicleArrivalAction vehicleAction)
-                arrivalActionVehicleField(vehicleAction) = __instance.Vehicle;
+            if (MP.IsInMultiplayer)
+                SetArrivalActionVehicle(arrivalAction, __instance.Vehicle);
         }
 
         private static void PreOrderFlySetArrivalVehicle(AerialVehicleInFlight __instance, IArrivalAction arrivalAction)
         {
-            if (MP.IsInMultiplayer && arrivalAction is VehicleArrivalAction vehicleAction)
-                arrivalActionVehicleField(vehicleAction) = __instance.vehicle;
+            if (MP.IsInMultiplayer)
+                SetArrivalActionVehicle(arrivalAction, __instance.vehicle);
         }
 
-        private static bool PreOrderFlyToTiles(AerialVehicleInFlight __instance,
-            List<FlightNode> flightPath, IArrivalAction arrivalAction)
-        {
-            // Only intercept when called from UI (InInterface). OrderFlyToTiles is also
-            // called by VehicleSkyfaller_Leaving.LeaveMap during normal ticks — that must
-            // not be intercepted or the aerial vehicle never gets its flight path.
-            if (!MP.IsInMultiplayer || !MP.InInterface)
-                return true;
-
-            SyncedOrderFlyToTiles(__instance, flightPath, (VehicleArrivalAction)arrivalAction);
-            return false;
-        }
-
-        private static void SyncedOrderFlyToTiles(AerialVehicleInFlight aerialVehicle,
-            List<FlightNode> flightPath, VehicleArrivalAction arrivalAction)
-        {
-            if (arrivalAction != null)
-                arrivalActionVehicleField(arrivalAction) = aerialVehicle.vehicle;
-            aerialVehicle.OrderFlyToTiles(flightPath, arrivalAction);
-        }
-
-        private static void SyncIArrivalAction(SyncWorker sync, ref IArrivalAction action)
-        {
-            var vehicleAction = action as VehicleArrivalAction;
-            SyncVehicleArrivalAction(sync, ref vehicleAction);
-            action = vehicleAction;
-        }
-
-        private static readonly AccessTools.FieldRef<VehicleArrivalAction, VehiclePawn> arrivalActionVehicleField
-            = AccessTools.FieldRefAccess<VehicleArrivalAction, VehiclePawn>("vehicle");
-
-        /// <summary>
-        /// Extract GlobalTargetInfo targets as plain int lists to avoid MP's broken
-        /// GlobalTargetInfo serializer (writes PlanetTile as 8 bytes, reads as 4).
-        /// </summary>
-        private static void ExtractTargetData(IEnumerable<GlobalTargetInfo> targets,
-            out List<int> tileIds, out List<int> layerIds, out List<int> worldObjectIds)
-        {
-            tileIds = [];
-            layerIds = [];
-            worldObjectIds = [];
-            if (targets == null) return;
-            foreach (var target in targets)
-            {
-                tileIds.Add(target.Tile.tileId);
-                layerIds.Add(target.Tile.Layer.LayerID);
-                worldObjectIds.Add(target.HasWorldObject ? target.WorldObject.ID : -1);
-            }
-        }
-
-        /// <summary>Reconstruct TargetData from serialized int lists.</summary>
-        private static SmashTools.Targeting.TargetData<GlobalTargetInfo> ReconstructTargetData(
-            List<int> tileIds, List<int> layerIds, List<int> worldObjectIds)
-        {
-            var targetData = new SmashTools.Targeting.TargetData<GlobalTargetInfo>();
-            for (var i = 0; i < tileIds.Count; i++)
-            {
-                var woId = worldObjectIds[i];
-                if (woId >= 0)
-                {
-                    var wo = Find.WorldObjects.AllWorldObjects.FirstOrDefault(o => o.ID == woId);
-                    if (wo != null)
-                    {
-                        targetData.targets.Add(new GlobalTargetInfo(wo));
-                        continue;
-                    }
-                }
-                targetData.targets.Add(new GlobalTargetInfo(new PlanetTile(tileIds[i], layerIds[i])));
-            }
-            return targetData;
-        }
-
-        private static void SyncVehicleArrivalAction(SyncWorker sync, ref VehicleArrivalAction action)
+        private static void SyncGlobalTargetData(SyncWorker sync,
+            ref SmashTools.Targeting.TargetData<GlobalTargetInfo> targetData)
         {
             if (sync.isWriting)
             {
-                var isNull = action == null;
-                sync.Write(isNull);
-                if (!isNull)
-                {
-                    sync.Write(action.GetType().FullName);
-                    // Write vehicle thingIDNumber — can't use sync.Write<VehiclePawn> because
-                    // the vehicle may be in a transitional state (inside skyfaller).
-                    // We'll resolve it from the comp's vehicle during Launch execution.
-                    var vehicle = arrivalActionVehicleField(action);
-                    sync.Write(vehicle?.thingIDNumber ?? -1);
-                }
+                sync.Write(targetData.targets);
+                return;
             }
-            else
-            {
-                var isNull = sync.Read<bool>();
-                if (isNull)
-                    return;
 
-                var typeName = sync.Read<string>();
-                var vehicleId = sync.Read<int>();
-
-                if (string.IsNullOrEmpty(typeName))
-                    return;
-
-                var type = AccessTools.TypeByName(typeName);
-                if (type == null)
-                    return;
-
-                action = (VehicleArrivalAction)Activator.CreateInstance(type);
-                // Vehicle will be resolved when Launch executes — the CompVehicleLauncher
-                // target is synced separately and has the correct vehicle reference.
-                // Store the ID for now; the Launch method sets it via the comp's Vehicle.
-            }
+            var targets = sync.Read<List<GlobalTargetInfo>>();
+            targetData = new SmashTools.Targeting.TargetData<GlobalTargetInfo>();
+            if (targets != null)
+                targetData.targets.AddRange(targets);
         }
 
         private static void PreMoveForwardFixArrivalVehicle(AerialVehicleInFlight __instance)
@@ -1112,10 +1196,10 @@ namespace Multiplayer.Compat
             // calls Arrived. The vehicle Scribe_Reference may fail to resolve after
             // MP save/load because the vehicle is inside the aerial vehicle's container.
             if (__instance.flightPath?.ArrivalAction is VehicleArrivalAction action
-                && arrivalActionVehicleField(action) == null
+                && action.vehicle == null
                 && __instance.vehicle != null)
             {
-                arrivalActionVehicleField(action) = __instance.vehicle;
+                action.vehicle = __instance.vehicle;
             }
         }
 
@@ -1134,130 +1218,30 @@ namespace Multiplayer.Compat
             }
         }
 
-        private static void CleanupDestroyedCaravans(VehicleCaravan __instance)
-        {
-            // If we launched a VehicleCaravan, it won't deselect it (as the sync context was world selected).
-            // We need to do it manually. Specifically from GetInspectString, as it seems like the safest
-            // place to do so.
-            if (__instance.Destroyed)
-            {
-                foreach (var vehicle in __instance.Vehicles)
-                {
-                    var aerialVehicle = vehicle.GetAerialVehicle();
-                    if (aerialVehicle != null)
-                        Find.WorldSelector.Select(aerialVehicle);
-                }
-
-                Find.WorldSelector.Deselect(__instance);
-            }
-        }
-
         #endregion
 
         #region SyncWorkers
 
-        private static void NoSync(SyncWorker sync, ref object target)
-        {
-        }
-
-        private static void SyncVehiclePawn(SyncWorker sync, ref VehiclePawn vehicle)
+        private static void SyncFuelGizmo(SyncWorker sync, ref Gizmo_RefuelableFuelTravel gizmo)
         {
             if (sync.isWriting)
-            {
-                if (vehicle == null)
-                {
-                    sync.Write(byte.MaxValue);
-                    return;
-                }
-
-                var aerialVehicle = vehicle.GetAerialVehicle();
-                if (aerialVehicle == null)
-                {
-                    // The first possible scenario when syncing - the vehicle exists as normal, and sync it as such.
-                    sync.Write((byte)0);
-                    sync.Write<Pawn>(vehicle);
-                }
-                else
-                {
-                    // The second possible scenario when syncing - the vehicle exists as a world object, which needs
-                    // to be synced instead of the vehicle itself.
-                    // The vehicle apparently specifies the world object as its parent holder, but the world object
-                    // only returns the list of vehicle's cargo (instead of the vehicle itself), which causes MP to
-                    // fail syncing the vehicle in a situation like that.
-                    // Also write the thingId as fallback — the AerialVehicleInFlight may be destroyed
-                    // by arrival before this command executes.
-                    sync.Write((byte)1);
-                    sync.Write(aerialVehicle);
-                    sync.Write(vehicle.thingIDNumber);
-                }
-            }
+                sync.Write(gizmo.refuelable);
             else
-            {
-                var type = sync.Read<byte>();
-                switch (type)
-                {
-                    case 0:
-                    {
-                        vehicle = sync.Read<Pawn>() as VehiclePawn;
-                        break;
-                    }
-                    case 1:
-                    {
-                        var vehicleInFlight = sync.Read<AerialVehicleInFlight>();
-                        var thingId = sync.Read<int>();
-                        vehicle = vehicleInFlight?.vehicle;
-
-                        // Fallback: if the AerialVehicleInFlight was destroyed (vehicle arrived),
-                        // try to find the vehicle by thingId — it may now be spawned on a map.
-                        if (vehicle == null && MP.TryGetThingById(thingId, out var thing))
-                            vehicle = thing as VehiclePawn;
-
-                        break;
-                    }
-                    case byte.MaxValue:
-                        break;
-                    default:
-                        throw new Exception($"Trying to read {nameof(VehiclePawn)}, but received an unsupported holder type ({type})");
-                }
-            }
-        }
-
-        private static void SyncFueledTravelComp(SyncWorker sync, ref CompFueledTravel fueledTravel)
-        {
-            if (sync.isWriting)
-                sync.Write(fueledTravel.parent as VehiclePawn);
-            else
-                fueledTravel = sync.Read<VehiclePawn>()?.CompFueledTravel;
+                gizmo = new Gizmo_RefuelableFuelTravel(sync.Read<CompFueledTravel>(), false);
         }
 
         private static void SyncVehicleComponent(SyncWorker sync, ref VehicleComponent comp)
         {
             if (sync.isWriting)
             {
-                var vehicle = comp.vehicle;
-                var comps = vehicle.statHandler.components;
-
-                var compIndex = comps.IndexOf(comp);
-                sync.Write(compIndex);
-                if (compIndex >= 0)
-                    sync.Write(vehicle);
-                else
-                    Log.Error($"Trying to write a VehicleComponent, but the vehicle this component belongs to does not contain it. Vehicle={vehicle}, compCount={comps.Count}");
+                sync.Write(comp?.props?.key);
+                sync.Write(comp?.vehicle);
             }
             else
             {
-                var compIndex = sync.Read<int>();
-
-                if (compIndex >= 0)
-                {
-                    var vehicle = sync.Read<VehiclePawn>();
-                    var compList = vehicle.statHandler.components;
-
-                    if (compIndex < compList.Count)
-                        comp = compList[compIndex];
-                    else
-                        Log.Error($"Trying to read VehicleComponent, but we've received component with index out of range. Vehicle={vehicle}, index={compIndex}, compCount={compList.Count}");
-                }
+                var key = sync.Read<string>();
+                var vehicle = sync.Read<VehiclePawn>();
+                comp = key == null ? null : vehicle?.statHandler.GetComponent(key);
             }
         }
 
@@ -1265,47 +1249,23 @@ namespace Multiplayer.Compat
         {
             if (sync.isWriting)
             {
-                sync.Write(turret.uniqueID);
-                sync.Write(turret.vehicle);
+                sync.Write(turret?.key);
+                sync.Write(turret?.vehicle);
             }
             else
             {
-                var id = sync.Read<int>();
-                var vehiclePawn = sync.Read<VehiclePawn>();
-
-                switch (id)
-                {
-                    case -1:
-                        Log.Error($"Trying to read VehicleTurret, received an uninitialized turret. Vehicle={vehiclePawn}, id=-1");
-                        return;
-                    case < -1:
-                        Log.Warning($"Trying to read VehicleTurret, received a turret with local ID. This shouldn't happen. Vehicle={vehiclePawn}, id={id}");
-                        return;
-                }
-
-                if (vehiclePawn == null)
-                {
-                    Log.Error($"Trying to read VehicleTurret, received a null parent vehicle. id={id}");
-                    return;
-                }
-
-                var comp = vehiclePawn.CompVehicleTurrets;
-                if (vehiclePawn.CompVehicleTurrets == null)
-                {
-                    Log.Error($"Trying to read VehicleTurret, the vehicle doesn't contain CompVehicleTurrets. Vehicle={vehiclePawn}, id={id}");
-                    return;
-                }
-
-                if (comp.turrets == null)
-                {
-                    Log.Error($"Trying to read VehicleTurret, but the CompVehicleTurrets contains a null list of turrets. Vehicle={vehiclePawn}, id={id}, comp={comp}");
-                    return;
-                }
-
-                turret = comp.turrets.FirstOrDefault(t => t.uniqueID == id);
-                if (turret == null)
-                    Log.Error($"Trying to read VehicleTurret, but the list of turrets does not contain the turret we're trying to read. Vehicle={vehiclePawn}, id={id}, comp={comp}");
+                var key = sync.Read<string>();
+                var vehicle = sync.Read<VehiclePawn>();
+                turret = key == null ? null : vehicle?.CompVehicleTurrets?.GetTurret(key);
             }
+        }
+
+        private static void SyncAutoLoadConfig(SyncWorker sync, ref AutoLoadConfig config)
+        {
+            if (sync.isWriting)
+                sync.Write(config.turret);
+            else
+                config = sync.Read<VehicleTurret>()?.loadConfig;
         }
 
         private static void SyncVehicleIgnitionController(SyncWorker sync, ref VehicleIgnitionController controller)
@@ -1318,8 +1278,6 @@ namespace Multiplayer.Compat
             {
                 var vehiclePawn = sync.Read<VehiclePawn>();
                 controller = vehiclePawn?.ignition;
-                if (controller == null)
-                    Log.Error($"Trying to read VehicleIgnitionController, but the vehicle is missing it. Vehicle={vehiclePawn}");
             }
         }
 
@@ -1327,78 +1285,22 @@ namespace Multiplayer.Compat
         {
             if (sync.isWriting)
             {
-                sync.Write(handler.uniqueID);
-                sync.Write(handler.vehicle);
+                sync.Write(handler?.role?.key);
+                sync.Write(handler?.vehicle);
             }
             else
             {
-                var id = sync.Read<int>();
-                var vehiclePawn = sync.Read<VehiclePawn>();
-
-                switch (id)
-                {
-                    case -1:
-                        Log.Error($"Trying to read VehicleRoleHandler, received an uninitialized handler. Vehicle={vehiclePawn}, id=-1");
-                        return;
-                    case < -1:
-                        Log.Warning($"Trying to read VehicleRoleHandler, received handler with local ID. This shouldn't happen. Vehicle={vehiclePawn}, id={id}");
-                        return;
-                }
-
-                if (vehiclePawn == null)
-                {
-                    Log.Error($"Trying to read VehicleRoleHandler, received a null parent vehicle. id={id}");
-                    return;
-                }
-
-                if (vehiclePawn.handlers == null)
-                {
-                    Log.Error($"Trying to read VehicleRoleHandler, but the vehicle contains a null list of handlers. Vehicle={vehiclePawn}, id={id}");
-                    return;
-                }
-
-                handler = vehiclePawn.handlers.FirstOrDefault(t => t.uniqueID == id);
-                if (handler == null)
-                    Log.Error($"Trying to read VehicleRoleHandler, but the list of handlers does not contain the handler we're trying to read. Vehicle={vehiclePawn}, id={id}");
+                var roleKey = sync.Read<string>();
+                var vehicle = sync.Read<VehiclePawn>();
+                handler = roleKey == null ? null : vehicle?.GetHandler(roleKey);
             }
         }
 
         private static void SyncCommandTurret(SyncWorker sync, ref Command_Turret command)
         {
-            if (sync.isWriting)
-            {
-                // We could technically just sync the turret and use its vehicle field.
-                // Syncing it anyway in case some mods do weird stuff with this.
-                sync.Write(command.vehicle);
-
-                // Not syncing other fields, as it doesn't seem they're needed.
-            }
-            else
-            {
-                // isImplicit: true
-                // If any subclass ever introduces a constructor we'll need to replace it with call to `FormatterServices.GetUninitializedObject(type)`
-
-                command.vehicle = sync.Read<VehiclePawn>();
-            }
-
             SyncVehicleTurret(sync, ref command.turret);
-        }
-
-        // Used by caravan forming session
-        private static void SyncAssignedSeat(SyncWorker sync, ref AssignedSeat seat)
-        {
-            if (sync.isWriting)
-            {
-                sync.Write(seat.handler);
-            }
-            else
-            {
-                var handler = sync.Read<VehicleRoleHandler>();
-                seat = new AssignedSeat
-                {
-                    handler = handler,
-                };
-            }
+            if (!sync.isWriting)
+                command.vehicle = command.turret?.vehicle;
         }
 
         // Needed by the load cargo dialog/session sync field
@@ -1412,9 +1314,9 @@ namespace Multiplayer.Compat
         private static void SyncLaunchProtocol(SyncWorker sync, ref LaunchProtocol launchProtocol)
         {
             if (sync.isWriting)
-                sync.Write(launchProtocol?.vehicle);
+                sync.Write(launchProtocol?.vehicle?.CompVehicleLauncher);
             else
-                launchProtocol = sync.Read<VehiclePawn>()?.CompVehicleLauncher?.launchProtocol;
+                launchProtocol = sync.Read<CompVehicleLauncher>()?.launchProtocol;
         }
 
         private static void SyncFlightNode(SyncWorker sync, ref FlightNode node)
@@ -1575,17 +1477,8 @@ namespace Multiplayer.Compat
 
             public static void CreateLoadVehicleCargoSession(VehiclePawn vehicle)
             {
-                if (vehicle == null)
-                {
-                    Log.Error($"Trying to create {nameof(LoadVehicleCargoSession)} for a null vehicle.");
+                if (vehicle?.Map == null)
                     return;
-                }
-
-                if (vehicle.Map == null)
-                {
-                    Log.Error($"Trying to create {nameof(LoadVehicleCargoSession)} for a vehicle with null map. Vehicle={vehicle}");
-                    return;
-                }
 
                 var manager = MP.GetLocalSessionManager(vehicle.Map);
                 var session = manager.GetFirstOfType<LoadVehicleCargoSession>();
@@ -1596,9 +1489,7 @@ namespace Multiplayer.Compat
                         session = null;
                 }
 
-                if (session == null)
-                    Log.Error($"Couldn't get or create {nameof(LoadVehicleCargoSession)}");
-                else if (MP.IsExecutingSyncCommandIssuedBySelf)
+                if (session != null && MP.IsExecutingSyncCommandIssuedBySelf)
                     session.OpenWindow();
             }
 
@@ -1686,62 +1577,39 @@ namespace Multiplayer.Compat
                 MP.GetLocalSessionManager(map).GetFirstOfType<LoadVehicleCargoSession>()?.AddItems();
         }
 
-        private static bool ReplacedLoadCargoCancelButton(Rect rect, string label, bool drawBackground, bool doMouseoverSound, bool active, TextAnchor? overrideTextAnchor)
+        private static void PreLoadCargoButtonText(string label, ref bool __state)
         {
-            bool DoButton() => Widgets.ButtonText(rect, label, drawBackground, doMouseoverSound, active, overrideTextAnchor);
-
-            if (LoadVehicleCargoSession.drawingSession == null)
-                return DoButton();
-
-            var color = GUI.color;
-            try
+            if (LoadVehicleCargoSession.drawingSession != null && label == "CancelButton".Translate())
             {
-                // Red button like in MP
                 GUI.color = new Color(1f, 0.3f, 0.35f);
-
-                // If the button was pressed sync removing the dialog
-                if (DoButton())
-                    LoadVehicleCargoSession.drawingSession.Remove();
+                __state = true;
             }
-            finally
-            {
-                GUI.color = color;
-            }
-
-            return false;
         }
 
-        private static bool ReplacedLoadCargoResetButton(Rect rect, string label, bool drawBackground, bool doMouseoverSound, bool active, TextAnchor? overrideTextAnchor)
+        private static void PostLoadCargoButtonText(bool __state)
         {
-            var result = Widgets.ButtonText(rect, label, drawBackground, doMouseoverSound, active, overrideTextAnchor);
-
-            if (!result || LoadVehicleCargoSession.drawingSession == null)
-                return result;
-
-            LoadVehicleCargoSession.drawingSession.Reset();
-            return false;
+            if (__state)
+                GUI.color = Color.white;
         }
 
-        private static bool ReplacedLoadCargoAcceptButton(Rect rect, string label, bool drawBackground, bool doMouseoverSound, bool active, TextAnchor? overrideTextAnchor)
+        private static void PostLoadCargoButtonTextWorker(string label, ref Widgets.DraggableResult __result)
         {
-            var result = Widgets.ButtonText(rect, label, drawBackground, doMouseoverSound, active, overrideTextAnchor);
+            var session = LoadVehicleCargoSession.drawingSession;
+            if (session == null || !__result.AnyPressed())
+                return;
 
-            if (!result || LoadVehicleCargoSession.drawingSession == null)
-                return result;
+            if (label == "AcceptButton".Translate())
+                session.Accept();
+            else if (label == "ResetButton".Translate())
+                session.Reset();
+            else if (label == "CancelButton".Translate())
+                session.Remove();
+            else if (label == "Dev: Pack Instantly")
+                session.PackInstantly();
+            else
+                return;
 
-            LoadVehicleCargoSession.drawingSession.Accept();
-            return false;
-        }
-
-        private static bool ReplacedLoadCargoPackInstantlyButton(Rect rect, string label, bool drawBackground, bool doMouseoverSound, bool active, TextAnchor? overrideTextAnchor)
-        {
-            var result = Widgets.ButtonText(rect, label, drawBackground, doMouseoverSound, active, overrideTextAnchor);
-
-            if (!result || LoadVehicleCargoSession.drawingSession == null)
-                return result;
-
-            LoadVehicleCargoSession.drawingSession.PackInstantly();
-            return false;
+            __result = Widgets.DraggableResult.Idle;
         }
 
         private static bool PreLoadCargoSetToSendEverything()
@@ -1843,7 +1711,6 @@ namespace Multiplayer.Compat
                 if (vehicle.Spawned)
                 {
                     vehicles.Remove(vehicle);
-                    Log.Error($"{nameof(FlyingVehicleTargetedLandingSession)} contained a vehicle that it should no longer contain, sessionID={SessionId}, vehicle={vehicle}");
                     return;
                 }
 
@@ -1908,9 +1775,8 @@ namespace Multiplayer.Compat
 
         private static void PreventMapRemovalForLandingSessions(ref bool __result, Map ___map)
         {
-            // The map would get removed due to no active pawns. The mod would prevent the map removal
-            // if the LandingTargeter was active, which in our patch - it isn't. It also checks active
-            // pawns in skyfallers, which again - likely none are active at this point.
+            // The MP landing session replaces Vehicle Framework's local targeter, so keep the
+            // destination map alive while that session is waiting for a landing cell.
             if (MP.IsInMultiplayer && !__result)
                 __result = MP.GetLocalSessionManager(___map).GetFirstOfType<FlyingVehicleTargetedLandingSession>() != null;
         }
@@ -1931,65 +1797,6 @@ namespace Multiplayer.Compat
         #endregion
 
         #region Shared
-
-        private static void CreateAndSyncMpTransferableReference(ISessionWithTransferables session, Transferable transferable)
-            => syncTradeableCount.Watch(Activator.CreateInstance(mpTransferableReferenceType, session, transferable));
-
-        // MP approach is to intercept `Widgets.ButtonTextWorker` call with a prefix/postfix call.
-        // Our approach here is to replace the `Widgets.ButtonText` call itself with our intercepted one.
-        private static IEnumerable<CodeInstruction> ReplaceButtonsTranspiler(IEnumerable<CodeInstruction> instr, MethodBase baseMethod)
-        {
-            var target = AccessTools.DeclaredMethod(typeof(Widgets), nameof(Widgets.ButtonText),
-                [typeof(Rect), typeof(string), typeof(bool), typeof(bool), typeof(bool), typeof(TextAnchor?)]);
-            var buttonReplacements = new Dictionary<string, MethodInfo>();
-            int expected;
-
-            if (baseMethod.DeclaringType == typeof(Dialog_LoadCargo))
-            {
-                expected = 4;
-                buttonReplacements.Add("CancelButton", AccessTools.DeclaredMethod(typeof(VehicleFramework), nameof(ReplacedLoadCargoCancelButton)));
-                buttonReplacements.Add("ResetButton", AccessTools.DeclaredMethod(typeof(VehicleFramework), nameof(ReplacedLoadCargoResetButton)));
-                buttonReplacements.Add("AcceptButton", AccessTools.DeclaredMethod(typeof(VehicleFramework), nameof(ReplacedLoadCargoAcceptButton)));
-                buttonReplacements.Add("Dev: Pack Instantly", AccessTools.DeclaredMethod(typeof(VehicleFramework), nameof(ReplacedLoadCargoPackInstantlyButton)));
-            }
-            else
-                throw new Exception($"Trying to patch a method for unsupported type: {baseMethod.DeclaringType}");
-
-            var replacedCount = 0;
-            MethodInfo currentButtonReplacement = null;
-
-            foreach (var ci in instr)
-            {
-                if (currentButtonReplacement != null)
-                {
-                    if (ci.Calls(target))
-                    {
-                        ci.operand = currentButtonReplacement;
-                        currentButtonReplacement = null;
-                        replacedCount++;
-                    }
-                }
-                else if (ci.opcode == OpCodes.Ldstr && ci.operand is string text)
-                {
-                    buttonReplacements.TryGetValue(text, out currentButtonReplacement);
-                }
-
-                yield return ci;
-            }
-
-            if (replacedCount != expected)
-            {
-                var name = (baseMethod.DeclaringType?.Namespace).NullOrEmpty() ? baseMethod.Name : $"{baseMethod.DeclaringType!.Name}:{baseMethod.Name}";
-                Log.Warning($"Patched incorrect number of Widgets.ButtonText calls (patched {replacedCount}, expected {expected}) for method {name}");
-            }
-#if DEBUG
-            else
-            {
-                var name = (baseMethod.DeclaringType?.Namespace).NullOrEmpty() ? baseMethod.Name : $"{baseMethod.DeclaringType!.Name}:{baseMethod.Name}";
-                Log.Message($"Patched Widgets.ButtonText calls (patched {replacedCount}, expected {expected}) for method {name}");
-            }
-#endif
-        }
 
         private static void InsertSwitchToMap(Window __instance, Rect __0)
         {
@@ -2016,15 +1823,12 @@ namespace Multiplayer.Compat
         [MpCompatPostfix(typeof(VehiclePawn), nameof(VehiclePawn.Tick))]
         private static void PostVehicleTick(VehiclePawn __instance)
         {
-            // Ignore out of MP, drawing will update angles and stuff
             if (!MP.IsInMultiplayer)
                 return;
 
-            // Likely not needed if the vehicle is not spawned
             if (!__instance.Spawned)
                 return;
 
-            // Make sure that the vehicle has turrets at all
             var turretsComp = __instance.CompVehicleTurrets;
             if (turretsComp == null)
                 return;
@@ -2041,26 +1845,6 @@ namespace Multiplayer.Compat
                     turret.TurretRotation = Mathf.Repeat(turret.TurretRotation, 360f);
                 }
             }
-        }
-
-        // DISABLED: TurretRotation getter prefix/postfix causes native crash on turret vehicle spawn.
-        // The old approach saved/restored rotation around the getter to prevent drawing from
-        // affecting game state. With the new VF API (transform.rotation), this causes issues —
-        // likely recursive getter calls or uninitialized transform during spawn.
-        // Need a different approach for turret rotation determinism.
-        //
-        // [MpCompatPrefix(typeof(VehicleTurret), nameof(VehicleTurret.TurretRotation), methodType: MethodType.Getter)]
-        private static void PreTurretRotation(VehicleTurret __instance, ref float? __state)
-        {
-            if (MP.InInterface)
-                __state = __instance.TurretRotation;
-        }
-
-        // [MpCompatPostfix(typeof(VehicleTurret), nameof(VehicleTurret.TurretRotation), methodType: MethodType.Getter)]
-        private static void PostTurretRotation(VehicleTurret __instance, float? __state)
-        {
-            if (__state.HasValue)
-                __instance.TurretRotation = __state.Value;
         }
 
         [MpCompatPrefix(typeof(TurretTargeter), nameof(TurretTargeter.Turret), methodType: MethodType.Getter)]
@@ -2119,32 +1903,21 @@ namespace Multiplayer.Compat
 
         private static bool ShouldExecuteWhenFinished()
         {
-            // If not on main thread we always need to
-            // execute when finished, both in MP and in SP.
+            // Preserve Vehicle Framework's background-thread behavior.
             if (!UnityData.IsInMainThread)
                 return false;
-            // If main thread and not in MP, leave current behavior.
             if (!MP.IsInMultiplayer)
                 return true;
 
-            // If in MP and on main thread, ensure that we call it in
-            // ExecuteWhenFinished during game loading as it's
-            // unsafe there and will cause errors for the host.
-            // AllowedToRunLongEvents is false only for host during
-            // loading
+            // During MP loading, defer overlay initialization until play data is ready.
             return PatchingUtilities.AllowedToRunLongEvents;
         }
 
         [MpCompatTranspiler(typeof(UpgradeNode), nameof(UpgradeNode.AddOverlays))]
         private static IEnumerable<CodeInstruction> FixHostOverlayInit(IEnumerable<CodeInstruction> instr, MethodBase baseMethod)
         {
-            // The mod fails to initialize the overlays for the host when (re)loading the game.
-            // It fails to initialize the second time as the initialization method is not called
-            // inside "LongEventHandler.ExecuteWhenFinished" call (this only happens when not on
-            // the main thread, the code checks UnityData.IsInMainThread). The issue is that likely
-            // due to the way MP handles loading some of the data required for overlay initialization
-            // is not yet initialized. We need to ensure that the execution is delayed until it's
-            // safe to initialize them.
+            // The host reaches this main-thread path while MP is still loading play data. Treat it
+            // like the background path so Vehicle Framework defers overlay initialization safely.
 
             var target = AccessTools.DeclaredPropertyGetter(typeof(UnityData), nameof(UnityData.IsInMainThread));
             var replacement = MpMethodUtil.MethodOf(ShouldExecuteWhenFinished);
