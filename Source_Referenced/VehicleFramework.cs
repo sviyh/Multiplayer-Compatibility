@@ -39,6 +39,7 @@ namespace Multiplayer.Compat
 
         // VehiclesModSettings
         private static ISyncField showAllCargoItemsField;
+        private static ISyncField targetFuelPercentField;
 
         // VehiclePawn.<>c__DisplayClass250_0
         private static AccessTools.FieldRef<object, VehiclePawn> vehiclePawnInnerClassParentField;
@@ -62,6 +63,9 @@ namespace Multiplayer.Compat
 
         private static void LatePatch()
         {
+            // MP reloads the world for joining clients without disposing the Game.
+            // VF's disposal cleanup otherwise leaves targeters holding the previous map.
+            GameEvent.OnWorldUnloading += ClearVehicleTargetersForReload;
             #region MP Compat
 
             MethodInfo method;
@@ -154,8 +158,12 @@ namespace Multiplayer.Compat
 
                 // Comps
 
-                // Target fuel level setter, used from Gizmo_RefuelableFuelTravel
-                MP.RegisterSyncMethod(typeof(CompFueledTravel), nameof(CompFueledTravel.TargetFuelPercent));
+                // Gizmo_Slider assigns Target on every draw, even without input.
+                targetFuelPercentField = MP.RegisterSyncField(typeof(CompFueledTravel), "targetFuelPercent").SetBufferChanges();
+                MpCompat.harmony.Patch(
+                    AccessTools.DeclaredMethod(typeof(Gizmo_RefuelableFuelTravel), nameof(Gizmo_RefuelableFuelTravel.GizmoOnGUI)),
+                    prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreFuelGizmo)),
+                    finalizer: new HarmonyMethod(typeof(VehicleFramework), nameof(FinalizeFuelGizmo)));
                 // Refuel from inventory, used from Gizmo_RefuelableFuelTravel
                 MP.RegisterSyncMethod(typeof(CompFueledTravel), nameof(CompFueledTravel.Refuel), [typeof(List<Thing>)]);
                 MP.RegisterSyncMethod(typeof(CompFueledTravel), nameof(CompFueledTravel.Refuel), [typeof(float)]);
@@ -282,6 +290,13 @@ namespace Multiplayer.Compat
                     transpiler: new HarmonyMethod(typeof(VehicleFramework), nameof(ReplaceSetTargetCall)));
 
                 // Targetable turrets
+                // Opening the targeter clears the previous target even if the user cancels.
+                MpCompat.harmony.Patch(AccessTools.DeclaredMethod(typeof(Command_TargeterCooldownAction), nameof(Command_TargeterCooldownAction.FireTurret)),
+                    transpiler: new HarmonyMethod(typeof(VehicleFramework), nameof(ReplaceSetTargetCall)));
+                MpCompat.harmony.Patch(AccessTools.DeclaredMethod(typeof(TurretTargeter), nameof(TurretTargeter.BeginTargeting)),
+                    transpiler: new HarmonyMethod(typeof(VehicleFramework), nameof(ReplaceSetTargetCall)));
+                MpCompat.harmony.Patch(AccessTools.DeclaredMethod(typeof(TurretTargeter), nameof(TurretTargeter.StopTargeting), [typeof(bool)]),
+                    transpiler: new HarmonyMethod(typeof(VehicleFramework), nameof(ReplaceSetTargetCall)));
                 method = MpMethodUtil.GetLambda(typeof(Command_TargeterCooldownAction), nameof(Command_TargeterCooldownAction.FireTurret), lambdaOrdinal: 0);
                 var targetableTurretField = AccessTools.FieldRefAccess<VehicleTurret>(method.DeclaringType, "turret");
                 MP.RegisterSyncDelegateLambda(typeof(Command_TargeterCooldownAction), nameof(Command_TargeterCooldownAction.FireTurret), 0)
@@ -377,7 +392,10 @@ namespace Multiplayer.Compat
                 MpCompat.RegisterLambdaMethod("Vehicles.VehiclePawn", "ChangeColor", 0);
 
                 // Seat assignment is edited in a local dialog but consumed by caravan formation.
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedSetSeatAssignments));
+                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedSetSeatAssignments))
+                    .TransformArgument(1, Serializer.New(
+                        (List<Pawn> pawns) => pawns.Select(GetVehiclePawnReference).ToList(),
+                        references => references.Select(ResolveVehiclePawnReference).ToList()));
                 MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedRemoveSeatAssignments));
                 MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedClearSeatAssignments));
                 MpCompat.harmony.Patch(
@@ -481,7 +499,9 @@ namespace Multiplayer.Compat
                 // Used by Vehicles.ITab_Vehicle_Passengers and Vehicles.WITab_Vehicle_Manifest
                 method = AccessTools.DeclaredMethod(typeof(VehicleTabHelper_Passenger), nameof(VehicleTabHelper_Passenger.HandleDragEvent));
                 MpCompat.harmony.Patch(method, prefix: new HarmonyMethod(typeof(VehicleFramework), nameof(PreHandleDragEvent)));
-                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedHandleDragEvent));
+                MP.RegisterSyncMethod(typeof(VehicleFramework), nameof(SyncedHandleDragEvent))
+                    .TransformArgument(0, Serializer.New<Pawn, (Pawn pawn, VehiclePawn vehicle, int id)>(GetVehiclePawnReference, ResolveVehiclePawnReference))
+                    .TransformArgument(1, Serializer.New<Pawn, (Pawn pawn, VehiclePawn vehicle, int id)>(GetVehiclePawnReference, ResolveVehiclePawnReference));
 
                 // WITab_AerialVehicle_Items
                 // Aerial vehicle inventory tab
@@ -620,6 +640,8 @@ namespace Multiplayer.Compat
 
             {
                 MP.RegisterSyncWorker<Gizmo_RefuelableFuelTravel>(SyncFuelGizmo);
+                // MP does not serialize this tab; its drop commands use MapSelected to find the vehicle.
+                MP.RegisterSyncWorker<ITab_Vehicle_Cargo>(SyncCargoTab);
                 // Turret
                 MP.RegisterSyncWorker<Command_Turret>(SyncCommandTurret, typeof(Command_Turret), true, true);
                 // Vehicle pawn elements
@@ -715,6 +737,17 @@ namespace Multiplayer.Compat
                 assignments.Select(assignment => assignment.handler).ToList());
             return false;
         }
+
+        // MP can resolve ordinary pawns, but not pawns held by VehicleRoleHandler.
+        private static (Pawn pawn, VehiclePawn vehicle, int id) GetVehiclePawnReference(Pawn pawn)
+            => pawn?.ParentHolder is VehicleRoleHandler handler
+                ? (null, handler.vehicle, pawn.thingIDNumber)
+                : (pawn, null, -1);
+
+        private static Pawn ResolveVehiclePawnReference((Pawn pawn, VehiclePawn vehicle, int id) reference)
+            => reference.vehicle == null
+                ? reference.pawn
+                : reference.vehicle.AllPawnsAboard.FirstOrDefault(pawn => pawn.thingIDNumber == reference.id);
 
         private static void SyncedSetSeatAssignments(
             VehiclePawn vehicle,
@@ -1220,7 +1253,41 @@ namespace Multiplayer.Compat
 
         #endregion
 
+        #region Fuel gizmo
+
+        private static void PreFuelGizmo(Gizmo_RefuelableFuelTravel __instance, out bool __state)
+        {
+            __state = MP.IsInMultiplayer;
+            if (!__state)
+                return;
+
+            MP.WatchBegin();
+            targetFuelPercentField.Watch(__instance.refuelable);
+            // Refresh the local slider cache from the watched (possibly buffered) value.
+            __instance.targetValuePct = __instance.refuelable.TargetFuelPercent;
+        }
+
+        private static void FinalizeFuelGizmo(bool __state)
+        {
+            if (__state)
+                MP.WatchEnd();
+        }
+
+        private static void ClearVehicleTargetersForReload()
+        {
+            if (MP.IsInMultiplayer)
+                Targeters.ClearAllTargeters();
+        }
+
+        #endregion
+
         #region SyncWorkers
+
+        private static void SyncCargoTab(SyncWorker sync, ref ITab_Vehicle_Cargo tab)
+        {
+            if (!sync.isWriting)
+                tab = new ITab_Vehicle_Cargo();
+        }
 
         private static void SyncFuelGizmo(SyncWorker sync, ref Gizmo_RefuelableFuelTravel gizmo)
         {
